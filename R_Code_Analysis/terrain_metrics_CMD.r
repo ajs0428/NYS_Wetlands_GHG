@@ -9,7 +9,7 @@ args = commandArgs(trailingOnly = TRUE) # arguments are passed from terminal to 
 cat("these are the arguments: ", args, "\n")
 
 
-stopifnot("The number of arguments is less than 3" = length(args) < 3)
+stopifnot("The number of arguments is less than 3" = length(args) < 4)
 
 options(rgl.useNULL = TRUE) # prevents an rgl warning
 library(terra)
