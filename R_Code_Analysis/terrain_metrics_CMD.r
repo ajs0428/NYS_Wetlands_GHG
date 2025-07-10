@@ -1,10 +1,15 @@
 #!/usr/bin/env Rscript
 
+cat("args should be:", "\n",
+    "1) path to DEM folder", "\n", 
+    "2) an odd integer for the window size and scale", "\n",
+    "3) the number of cores for the computer to use", "\n")
+
 args = commandArgs(trailingOnly = TRUE) # arguments are passed from terminal to here
 cat("these are the arguments: ", args, "\n")
 
 
-stopifnot("The number of arguments is less than 3" = length(args) < 4)
+stopifnot("The number of arguments is less than 3" = length(args) < 3)
 
 options(rgl.useNULL = TRUE) # prevents an rgl warning
 library(terra)
