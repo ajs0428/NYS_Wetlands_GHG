@@ -2,12 +2,18 @@
 
 cat("args should be:", "\n",
     "1) path to DEM folder", "\n", 
-    "2) path to HUC watershed vector file \n",
-    "3) an odd integer for the window size and scale", "\n",
-    "4) the number of cores for the computer to use", "\n")
+    "2) path to save folder", "\n",
+    "3) path to HUC watershed vector file \n",
+    "4) an odd integer for the window size and scale", "\n",
+    "5) the number of cores for the computer to use", "\n")
 
 args = commandArgs(trailingOnly = TRUE) # arguments are passed from terminal to here
-cat("these are the arguments: \n", args[1], "\n", args[2], "\n", args[3], "\n", args[4], "\n")
+cat("these are the arguments: \n", 
+    "DEM folder:", args[1], "\n", 
+    "Save folder:", args[2], "\n", 
+    "HUC folder:", args[3], "\n", 
+    "Odd Integer:", args[4], "\n", 
+    "Number of cores:", args[5], "\n")
 
 
 stopifnot("The number of arguments is less than 4" = length(args) >= 4)
@@ -15,17 +21,17 @@ stopifnot("The number of arguments is less than 4" = length(args) >= 4)
 options(rgl.useNULL = TRUE) # prevents an rgl warning
 library(terra)
 library(MultiscaleDTM)
-library(tidyterra)
+suppressPackageStartupMessages(library(tidyterra))
 library(future)
 library(future.apply)
 
-corenum <- as.numeric(args[4])
+corenum <- as.numeric(args[5]) # fifth argument is cores
 stopifnot("Too many cores specified" = corenum <= future::availableCores()[[1]])
 plan(multicore, workers = corenum) # number of cores is decided by availableCores() and should work with Slurm scheduler
                         # this should probably be an argument for bash
 
-path_var = args[1] #the first argument should be a file path
-win_dim = as.numeric(args[3]) # the second argument should be an odd integer for the window size and scale
+path_var = args[2] #the second argument should be a file path to save to
+win_dim = as.numeric(args[4]) # the fourth argument should be an odd integer for the window size and scale
 
 stopifnot("The dimensions of the window are even" = win_dim%%2 != 0)
 
@@ -33,11 +39,11 @@ dems <- sprc(list.files(args[1],
                         pattern = ".img$",
                         full.names = TRUE))
 #print(dems)
-hucs <- vect(args[2])  |> 
+hucs <- vect(args[3])  |> # third argument is HUC folder
     terra::project(crs(dems[1]))
 
 huc_names <- as.list(hucs[["huc12"]][[1]])
-#print(huc8)
+
 
 terrain_calc_func <- function(hn, window = c(win_dim,win_dim) ){
     #print(window)
