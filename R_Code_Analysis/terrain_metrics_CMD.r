@@ -33,8 +33,9 @@ dems <- sprc(list.files(args[1],
                         pattern = ".img$",
                         full.names = TRUE))
 #print(dems)
-hucs <- vect(args[2], query = "SELECT * FROM NY_HUCS_08_6350 WHERE huc12 = '020200010102'")  |> 
+hucs <- vect(args[2])  |> 
     terra::project(crs(dems[1]))
+
 huc_names <- as.list(hucs[["huc12"]][[1]])
 #print(huc8)
 
