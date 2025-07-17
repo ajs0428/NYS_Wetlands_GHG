@@ -16,3 +16,4 @@ R_Code_Analysis/*/
 Python_Code_Analysis/*/
 
 !.gitignore
+.Rproj.user

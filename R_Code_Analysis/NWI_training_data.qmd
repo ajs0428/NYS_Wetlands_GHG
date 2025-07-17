@@ -5,7 +5,6 @@ format:
         embed-resources: true
 editor_options: 
   chunk_output_type: console
-
 ---
 
 ```{r}
@@ -45,6 +44,7 @@ writeVector(ny_hucs, "Data/NY_HUCS/NY_HUCS_08.gpkg", overwrite = TRUE)
 ```
 
 This is for one HUC
+
 
 ```{r}
 test_huc <- ny_hucs |> dplyr::filter(str_detect(huc12, "020501020703"))
