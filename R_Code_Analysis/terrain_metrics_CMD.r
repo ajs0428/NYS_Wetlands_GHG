@@ -32,7 +32,7 @@ library(future.apply)
 
 corenum <- as.numeric(args[5]) # fifth argument is cores
 stopifnot("Too many cores specified" = corenum <= future::availableCores()[[1]])
-plan(multicore, workers = corenum) # number of cores is decided by availableCores() and should work with Slurm scheduler
+plan(multisession, workers = corenum) # number of cores is decided by availableCores() and should work with Slurm scheduler
                         # this should probably be an argument for bash
 
 path_var = args[2] #the second argument should be a file path to save to
