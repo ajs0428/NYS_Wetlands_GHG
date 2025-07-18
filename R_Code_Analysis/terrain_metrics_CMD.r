@@ -50,7 +50,7 @@ hucs <- vect(args[3])  |> # third argument is HUC folder
 huc_names <- as.list(hucs[["huc12"]][[1]])
 
 
-terrain_calc_func <- function(hn, window = c(win_dim,win_dim) ){
+terrain_calc_func %<-% function(hn, window = c(win_dim,win_dim) ){
     #print(window)
     print(hn)
     huc <- tidyterra::filter(hucs, huc12 == hn)
