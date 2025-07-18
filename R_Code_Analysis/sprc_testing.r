@@ -1,11 +1,11 @@
 library(terra)
 
-l <- list.files("Data/DEMs/imgs/test/", pattern = ".img$", full.names = TRUE)
+l <- list.files("Data/DEMs/imgs/", pattern = ".img$", full.names = TRUE)
 
-z <- sprc(l)
+z <- vrt(l)
 
 h <- vect("Data/NY_HUCS/NY_HUCS_08_6350.gpkg", query = "SELECT * FROM NY_HUCS_08_6350 WHERE huc12 = '020200010102'")  |> 
-              terra::project(crs(z[1]))
+              terra::project(crs(z))
 #hc <- crop(h, vect(ext(z), crs = crs(z[1])))
 ha <- vect("Data/NY_HUCS/NY_HUCS_08_6350.gpkg")
 zc <- crop(z, h)
@@ -16,6 +16,8 @@ zc
 e <- ext(1651995.8279809, 1761602.7916477, 2504346.67266468, 2570110.85086476)
 ve <- vect(e, crs = crs(ha))
 hs <- vect("Data/NY_HUCS/NY_HUCS_08_6350.gpkg", filter = ve)
+writeVector(hs, "Data/NY_HUCS/NY_HUC12_subset.gpkg", overwrite = TRUE)
+
 hsnames <- as.list(hs[["huc12"]][[1]])
 f <- function(x){
     #print(x)
@@ -24,6 +26,19 @@ f <- function(x){
 
 lapply(hsnames, f)
 
+
+get_raster_metadata <- function(raster_path) {
+    r <- rast(raster_path)
+    list(
+        #path = raster_path,
+        #extent = ext(r),
+        crs(r, describe = TRUE)[[3]]#,
+        #name = basename(raster_path)
+    )
+}
+
+
+cl <- lapply(l, get_raster_metadata)
 
 
 

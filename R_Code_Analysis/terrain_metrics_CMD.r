@@ -8,6 +8,11 @@ cat("args should be:", "\n",
     "5) the number of cores for the computer to use", "\n")
 
 args = commandArgs(trailingOnly = TRUE) # arguments are passed from terminal to here
+# args <- c("Data/DEMs/imgs/test/",
+#           "Data/TerrainProcessed/", 
+#           "Data/NY_HUCS/NY_HUC12_subset.gpkg", 
+#           "5", 
+#           "8")
 cat("these are the arguments: \n", 
     "DEM folder:", args[1], "\n", 
     "Save folder:", args[2], "\n", 
@@ -35,12 +40,12 @@ win_dim = as.numeric(args[4]) # the fourth argument should be an odd integer for
 
 stopifnot("The dimensions of the window are even" = win_dim%%2 != 0)
 
-dems <- sprc(list.files(args[1],
+dems <- vrt(list.files(args[1],
                         pattern = ".img$",
                         full.names = TRUE))
 #print(dems)
 hucs <- vect(args[3])  |> # third argument is HUC folder
-    terra::project(crs(dems[1]))
+    terra::project(crs(dems))
 
 huc_names <- as.list(hucs[["huc12"]][[1]])
 
