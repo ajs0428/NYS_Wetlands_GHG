@@ -57,7 +57,7 @@ terrain_calc_func <- function(hn, window = c(win_dim,win_dim) ){
     print(huc)
     crp <- terra::crop(dems, huc)
     print(crp)
-    mos <- terra::mosaic(crp)
+    mos <- crp #terra::mosaic(crp)
     
     writeRaster(mos, filename = paste0(path_var, "/", hn, "_DEM_mosaic_", win_dim, ".tif"),
                 overwrite = T)
