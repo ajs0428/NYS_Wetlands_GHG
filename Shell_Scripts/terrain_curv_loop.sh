@@ -23,7 +23,6 @@ include=(84)
 for number in "${include[@]}"; do
     echo "Running Rscript with argument: $number"
     Rscript R_Code_Analysis/terrain_metrics_filter_singleVect_CMD.r \
-    "Data/NY_HUCS/NY_Cluster_Zones_250_NAomit.gpkg" \
     "$number" \
     "Data/TerrainProcessed/HUC_DEMs" \
     "curv" \

@@ -2,7 +2,7 @@
 
 args = c(
     "Data/NY_HUCS/NY_Cluster_Zones_250_NAomit.gpkg",
-    120,
+    208,
     "Data/NAIP/HUC_NAIP_Processed/"
 )
 args = commandArgs(trailingOnly = TRUE) # arguments are passed from terminal to here
@@ -27,6 +27,7 @@ library(doParallel)
 
 terraOptions(tempdir = "/ibstorage/anthony/NYS_Wetlands_GHG/Data/tmp")
 print(tempdir())
+setGDALconfig("GDAL_PAM_ENABLED", "FALSE") # does not create aux.xml files
 ###############################################################################################
 
 #Index of all NAIP tiles
@@ -60,7 +61,7 @@ process_huc <- function(i, cluster_target, naip_int_cluster, args) {
     dem_filename <- paste0("Data/TerrainProcessed/HUC_DEMs", "/cluster_", args[2], "_huc_", cluster_target$huc12[[i]], ".tif")
     
     # uncomment the if statement with file.exists to ignore files already created
-   # if(!file.exists(target_file)){
+   if(!file.exists(target_file)){
     print("no NAIP processed yet")
     
     naip_tiles_huc <- st_filter(naip_int_cluster, cluster_target[i,])
@@ -84,9 +85,9 @@ process_huc <- function(i, cluster_target, naip_int_cluster, args) {
     rm(np)
     rm(nall)
     gc()
-    # } else {
-    #     print("NAIP already processed")
-    # }
+    } else {
+        print("NAIP already processed")
+    }
     
     return(NULL)  # or return something meaningful if needed
 }
@@ -113,7 +114,7 @@ results <- future_lapply(
 
 # Run with non-parallel
 # results <- lapply(
-#     seq_along(cluster_target$huc12)[1],
+#     seq_along(cluster_target$huc12),
 #     FUN = process_huc,
 #     cluster_target = cluster_target,
 #     naip_int_cluster = naip_int_cluster,

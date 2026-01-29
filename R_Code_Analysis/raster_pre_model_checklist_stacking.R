@@ -82,15 +82,14 @@ if(is.null(bad_list)){
 bad_df <- data.frame("Date" = Sys.Date(),
                      "cluster" = args[2], 
                      "bad_huc_stacks" = bad_list)
-readr::write_csv(bad_df, append = TRUE, file = paste0("Data/Dataframes/Non_Stacking_HUCs_", str_replace(Sys.Date(), "-", "_"), ".csv"), 
-                 col_names = T)
 
+file_name <- paste0("Data/Dataframes/Non_Stacking_HUCs_", str_replace(Sys.Date(), "-", "_"), ".csv")
 
+if(file.exists(file_name)){
+    readr::write_csv(bad_df, append = TRUE, file = file_name, 
+                     col_names = F)
+} else {
+    readr::write_csv(bad_df,
+                     file = file_name)
+}
 
-# read.csv("Data/Dataframes/Non_Stacking_HUCs_2025_12-03.csv")
-# 
-# rast(dem_list[str_detect(dem_list, "020200031103")])
-# rast(terr_list[str_detect(terr_list, "020200031103")])
-# rast(naip_list[str_detect(naip_list, "020200031103")])
-# rast(chm_list[str_detect(chm_list, "020200031103")])
-# rast(hydro_list[str_detect(hydro_list, "020200031103")])

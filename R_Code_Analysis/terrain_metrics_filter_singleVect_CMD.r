@@ -1,7 +1,6 @@
 #!/usr/bin/env Rscript
 
-args = c("Data/NY_HUCS/NY_Cluster_Zones_250_NAomit.gpkg",
-         84,
+args = c(84,
          "Data/TerrainProcessed/HUC_DEMs/",
          "slp",
          "Data/TerrainProcessed/HUC_TerrainMetrics/"
@@ -9,14 +8,13 @@ args = c("Data/NY_HUCS/NY_Cluster_Zones_250_NAomit.gpkg",
 args = commandArgs(trailingOnly = TRUE) # arguments are passed from terminal to here
 
 cat("these are the arguments: \n", 
-    "- Path to a file vector study area", args[1], "\n",
-    "- Cluster number (integer 1-200ish):", args[2], "\n",
-    "- Path to the DEMs in TerrainProcessed folder", args[3], "\n",
-    "- Metric (slp, dmv, curv):", args[4], "\n", 
-    "- Path to the Save folder", args[5], "\n"
+    "- Cluster number (integer 1-200ish):", args[1], "\n",
+    "- Path to the DEMs in TerrainProcessed folder", args[2], "\n",
+    "- Metric (slp, dmv, curv):", args[3], "\n", 
+    "- Path to the Save folder", args[4], "\n"
 )
-###############################################################################################
 
+###############################################################################################
 library(terra)
 library(sf)
 library(MultiscaleDTM)
@@ -31,21 +29,27 @@ terraOptions(
     memfrac = 0.6,      # Use up to 60% of RAM before writing to disk
     threads = 2         # Internal threading for terra operations (per worker)
 )
+
+setGDALconfig("GDAL_PAM_ENABLED", "FALSE") # does not create aux.xml files
 ###############################################################################################
 
 process_scale <- function(dem_path, scale_factor, output_file, metric, scale_label) {
     
-    # if (file.exists(output_file)) {
-    #     message(paste0(metric, " ", scale_label, " already exists, skipping"))
-    #     return(invisible(NULL))
-    # }
+    if (file.exists(output_file)) {
+        message(paste0(metric, " ", scale_label, " already exists, skipping"))
+        return(invisible(NULL))
+    }
     
     message(paste0("Creating ", metric, " ", scale_label, " for: ", output_file))
     dem_rast <- rast(dem_path)
     # Aggregate and resample - store intermediate to avoid re-computation
-    smoothed <- dem_rast |>
-        terra::aggregate(scale_factor, fun = "mean", na.rm = TRUE) |>
-        terra::resample(y = dem_rast, method = "cubicspline")
+   if(scale_factor == 0){
+       smoothed = dem_rast
+   } else {
+       smoothed <- dem_rast |>
+           terra::aggregate(scale_factor, fun = "mean", na.rm = TRUE) |>
+           terra::resample(y = dem_rast, method = "cubicspline")
+   }
     
     # Compute metric and write directly to file
     result <- switch(metric,
@@ -54,10 +58,10 @@ process_scale <- function(dem_path, scale_factor, output_file, metric, scale_lab
                                                v = c("slope", "TPI"))
                          
                          sg <- rgeomorphon::geomorphons(elevation = smoothed, 
-                                                  search = 100, 
-                                                  use_meters = TRUE,
-                                                  skip = 5, 
-                                                  flat_angle_deg = 1.5)
+                                                        search = 100, 
+                                                        use_meters = TRUE,
+                                                        skip = 5, 
+                                                        flat_angle_deg = 1.5)
                          slp_sg <- c(slp, sg)
                          writeRaster(slp_sg,
                                      filename = output_file,
@@ -71,7 +75,7 @@ process_scale <- function(dem_path, scale_factor, output_file, metric, scale_lab
                          rm(slp)
                          rm(sg)
                          rm(slp_sg)
-                         },
+                     },
                      "dmv" = {
                          dmv_result <- MultiscaleDTM::DMV(smoothed, w = c(3, 3), 
                                                           stand = "none", include_scale = FALSE)
@@ -105,8 +109,9 @@ terrain_function <- function(dem_path, metric) {
     message(paste0("\n=== Processing: ", cluster_huc_name, " ==="))
     
     # Define output paths
-    base_path <- paste0(args[5], cluster_huc_name, "_terrain_", metric)
+    base_path <- paste0(args[4], cluster_huc_name, "_terrain_", metric)
     output_files <- list(
+        "local" = paste0(base_path, "_local.tif"),
         "5m"   = paste0(base_path, "_5m.tif"),
         "100m" = paste0(base_path, "_100m.tif"),
         "500m" = paste0(base_path, "_500m.tif")
@@ -114,7 +119,7 @@ terrain_function <- function(dem_path, metric) {
     
     tryCatch({
         # Process each scale - DEM loaded only once
-        process_scale(dem_path, 5,   output_files[["5m"]],   metric, "5m")
+        process_scale(dem_path, 0, output_files[["local"]],   metric, "local")
         process_scale(dem_path, 100, output_files[["100m"]], metric, "100m")
         process_scale(dem_path, 500, output_files[["500m"]], metric, "500m")
         
@@ -132,8 +137,8 @@ terrain_function <- function(dem_path, metric) {
 ###############################################################################################
 
 list_of_huc_dems <- list.files(
-    args[3],
-    pattern = paste0("^cluster_", args[2], "_.*\\.tif$"),  
+    args[2],
+    pattern = paste0("^cluster_", args[1], "_.*\\.tif$"),  
     full.names = TRUE
 ) |> str_subset(pattern = "wbt", negate = TRUE) 
 
@@ -153,14 +158,14 @@ plan(future.callr::callr)
 future_lapply(
     list_of_huc_dems,
     terrain_function,
-    metric = args[4],
+    metric = args[3],
     future.seed = TRUE,
     future.scheduling = 1.0  # Dynamic load balancing
 )
 
 lapply(list_of_huc_dems[1],
        terrain_function,
-       metric = args[4])
+       metric = args[3])
 # 
 # r <- rast("Data/TerrainProcessed/HUC_DEMs/cluster_120_huc_020200060609.tif")
 # 
