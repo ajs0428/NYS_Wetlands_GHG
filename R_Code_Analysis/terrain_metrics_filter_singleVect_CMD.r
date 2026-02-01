@@ -151,7 +151,7 @@ if(future::availableCores() > 16){
 } else {
     corenum <-  (future::availableCores())
 }
-options(future.globals.maxSize= 32.0 * 1e9)
+options(future.globals.maxSize= 48.0 * 1e9)
 # plan(multisession, workers = corenum)
 plan(future.callr::callr)
 
