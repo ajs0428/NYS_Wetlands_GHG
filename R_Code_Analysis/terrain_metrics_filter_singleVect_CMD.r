@@ -1,8 +1,8 @@
 #!/usr/bin/env Rscript
 
-args = c(84,
+args = c(64,
          "Data/TerrainProcessed/HUC_DEMs/",
-         "slp",
+         "curv",
          "Data/TerrainProcessed/HUC_TerrainMetrics/"
 )
 args = commandArgs(trailingOnly = TRUE) # arguments are passed from terminal to here
@@ -163,9 +163,9 @@ future_lapply(
     future.scheduling = 1.0  # Dynamic load balancing
 )
 
-lapply(list_of_huc_dems[1],
-       terrain_function,
-       metric = args[3])
+# lapply(list_of_huc_dems[1],
+#        terrain_function,
+#        metric = args[3])
 # 
 # r <- rast("Data/TerrainProcessed/HUC_DEMs/cluster_120_huc_020200060609.tif")
 # 
