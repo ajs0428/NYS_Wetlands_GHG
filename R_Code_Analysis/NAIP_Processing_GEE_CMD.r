@@ -31,8 +31,7 @@ setGDALconfig("GDAL_PAM_ENABLED", "FALSE") # does not create aux.xml files
 ###############################################################################################
 
 #Index of all NAIP tiles
-naip_index <- st_read("Data/NAIP/noaa_digital_coast_2017/tileindex_NY_NAIP_2017.shp", quiet = TRUE) |> 
-    st_transform(st_crs("EPSG:6347"))
+naip_index <- list.files("Data/NAIP/GEE_NAIP/ny_huc_naip_indices/", pattern = ".tif", full.names = TRUE)
 
 #Cluster of HUCs
 cluster_target <- sf::st_read(args[1], quiet = TRUE) |> 

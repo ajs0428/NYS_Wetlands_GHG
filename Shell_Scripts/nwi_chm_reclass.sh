@@ -20,7 +20,7 @@ include=(11 12 22 46 50 51 53 56 60 64 67 84 86 90 92 102 105 116 120 123 126 13
 # Loop through each number in the list
 for number in "${include[@]}"; do
     echo "Running Rscript with argument: $number"
-    Rscript R_Code_Analysis/NWI_CHM_reclass.R \
+    Rscript R_Code_Analysis/Wetlands_CHM_reclass.R \
     "$number" \
     "Data/NY_HUCS/NY_Cluster_Zones_250_NAomit_6347.gpkg" \
     "Data/NWI/NY_NWI_6347.gpkg" >> "Shell_Scripts/logs/nwi_rcl_$(date +%Y%m%d).log" 2>&1 
