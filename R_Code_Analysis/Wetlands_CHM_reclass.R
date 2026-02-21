@@ -14,9 +14,10 @@ set.seed(11)
 ########################################################################################
 
 args <- c(
-    50, #Target Cluster
+    208, #Target Cluster
     "Data/NY_HUCS/NY_Cluster_Zones_250_NAomit_6347.gpkg", #Clusters and HUCs
-    "Data/Laba_NYS_Info_Wetlands/Training_Shapefiles/94C_WetlandDelineations_AllProjects_20240210/94C_WetlandBoundary_20240207.shp" # Wetlands
+    "Data/Tompkins County Wetland Mapping 2015/Geospatial Data/Tompkins County Wetlands 2012 SHP/Tompkins County Wetlands 2012.shp", # Wetlands
+    "NWCS_Type" # Field for filtering and matching
     )
 
 
@@ -25,7 +26,8 @@ args = commandArgs(trailingOnly = TRUE) # arguments are passed from terminal to 
 cat("these are the arguments: \n", 
     "1) Cluster number for HUC groups:", args[1], "\n", 
     "2) path to the overall zones or study areas :", args[2], "\n",
-    "3) Path to the wetlands:", args[3], "\n"
+    "3) Path to the wetlands:", args[3], "\n",
+    "4) Field in polygons for filtering and extracting wetland type: ", args[4], "\n"
     )
 
 ########################################################################################
@@ -58,8 +60,7 @@ if(st_crs(wetlands) != st_crs("EPSG:6347")){
 }
 
 wetlands_filter <- wetlands |>
-    filter(!str_detect(ATTRIBUTE, "R1|R4|R5")) |> # remove and small streams (unreliable)
-    filter(!str_detect(WETLAND_TY, "Marine|Estuarine|Other")) # |> # remove marine/estuarine
+    filter(!str_detect(.data[[args[4]]], "^R1|^R3|^R4|^R5|^E1|^E2|^E3|^M1|^M2|^M3|^Other"))# remove and small streams (unreliable) # remove marine/estuarine
 
 # This gives it the "huc" and "cluster" fields, conveniently 
 wetlands_cluster <- st_intersection(wetlands_filter, huc_cluster) |> vect() |> terra::wrap()
@@ -77,32 +78,33 @@ wetland_chm_extract_classify <- function(huc_num){
         r_chm <- rast(l_chm_cluster[str_detect(l_chm_cluster , huc_num)])
         v_wet <- terra::unwrap(wetlands_cluster)
         v_wet <- v_wet[v_wet$huc12 == huc_num]
+        og_name <- tools::file_path_sans_ext(basename(args[3])) |> gsub(pattern = " ", replacement = "")
 
-        filename <- paste0("Data/Training_Data/Targeted_Wetlands_For_Field_Validation/NWI_CHM_reclass_withReview_cluster_", args[1], "_huc_", huc_num, ".gpkg")
+        filename <- paste0("Data/Training_Data/TompkinsCounty_Reclass/", og_name, "_cluster_", args[1], "_huc_", huc_num, ".gpkg")
         
         if(!file.exists(filename)){
-            message(paste0("Creating New NWI Reclass File: ", filename))
+            message(paste0("Creating New Wetlands Reclass File: ", filename))
             wet_chm <- terra::extract(r_chm, v_wet, "mean", bind = TRUE) |> 
                 tidyterra::mutate(
                     MOD_CLASS = dplyr::case_when(
-                        str_detect(ATTRIBUTE, "L1|L2|PUB|PUS|PAB|R2|R3") & !str_detect(ATTRIBUTE, "PFO|PEM|PSS") & CHM <= 1.0 ~ "OWW",
-                        # str_detect(ATTRIBUTE, "L1|L2|PUB|PUS|PAB|R2|R3") & !str_detect(ATTRIBUTE, "PFO|PEM|PSS") & CHM > 1.0 & CHM <= 3.5 ~ "EMW",
-                        str_detect(ATTRIBUTE, "PSS") & !str_detect(ATTRIBUTE, "FO|EM") & CHM >= 1.0 & CHM <= 5.0 ~ "SSW",
-                        str_detect(ATTRIBUTE, "PSS") & !str_detect(ATTRIBUTE, "FO|EM") & CHM > 5.0 ~ "FSW",
-                        str_detect(ATTRIBUTE, "PEM") & !str_detect(ATTRIBUTE, "FO|SS") & CHM <= 3.5 ~ "EMW",
-                        str_detect(ATTRIBUTE, "PEM") & !str_detect(ATTRIBUTE, "FO|SS") & CHM >= 1.0 & CHM <= 5.0 ~ "SSW",
-                        str_detect(ATTRIBUTE, "PEM") & !str_detect(ATTRIBUTE, "FO|SS") & CHM > 5.0 ~ "FSW",
-                        str_detect(ATTRIBUTE, "PFO") & !str_detect(ATTRIBUTE, "SS|EM") & CHM >= 1.0 & CHM <= 5.0 ~ "SSW",
-                        str_detect(ATTRIBUTE, "PFO") & !str_detect(ATTRIBUTE, "SS|EM") & CHM > 5.0 ~ "FSW",
-                        str_detect(ATTRIBUTE, "PFO") & str_detect(ATTRIBUTE, "SS|EM") & CHM <= 3.5 ~ "EMW",
-                        str_detect(ATTRIBUTE, "PFO") & str_detect(ATTRIBUTE, "SS|EM") & CHM >= 1.0 & CHM <= 5.0 ~ "SSW",
-                        str_detect(ATTRIBUTE, "PFO") & str_detect(ATTRIBUTE, "SS|EM") & CHM > 5.0 ~ "FSW",
-                        str_detect(ATTRIBUTE, "PSS") & str_detect(ATTRIBUTE, "FO") & CHM >= 1.0 & CHM <= 5.0 ~ "SSW",
-                        str_detect(ATTRIBUTE, "PSS") & str_detect(ATTRIBUTE, "FO") & CHM > 5.0 ~ "FSW",
-                        str_detect(ATTRIBUTE, "PSS") & str_detect(ATTRIBUTE, "EM") & CHM <= 3.5 ~ "EMW",
-                        str_detect(ATTRIBUTE, "PSS") & str_detect(ATTRIBUTE, "EM") & CHM > 3.5 & CHM <= 5.0 ~ "SSW",
-                        str_detect(ATTRIBUTE, "PEM") & str_detect(ATTRIBUTE, "SS") & CHM <= 3.5 ~ "EMW",
-                        str_detect(ATTRIBUTE, "PEM") & str_detect(ATTRIBUTE, "SS") & CHM > 3.5 & CHM <= 5.0 ~ "SSW",
+                        str_detect(.data[[args[4]]], "L1|L2|PUB|PUS|PAB|R2|R3") & !str_detect(.data[[args[4]]], "PFO|PEM|PSS") & CHM <= 1.0 ~ "OWW",
+                        # str_detect(.data[[args[4]]], "L1|L2|PUB|PUS|PAB|R2|R3") & !str_detect(.data[[args[4]]], "PFO|PEM|PSS") & CHM > 1.0 & CHM <= 3.5 ~ "EMW",
+                        str_detect(.data[[args[4]]], "PSS") & !str_detect(.data[[args[4]]], "FO|EM") & CHM >= 1.0 & CHM <= 5.0 ~ "SSW",
+                        str_detect(.data[[args[4]]], "PSS") & !str_detect(.data[[args[4]]], "FO|EM") & CHM > 5.0 ~ "FSW",
+                        str_detect(.data[[args[4]]], "PEM") & !str_detect(.data[[args[4]]], "FO|SS") & CHM <= 3.5 ~ "EMW",
+                        str_detect(.data[[args[4]]], "PEM") & !str_detect(.data[[args[4]]], "FO|SS") & CHM >= 1.0 & CHM <= 5.0 ~ "SSW",
+                        str_detect(.data[[args[4]]], "PEM") & !str_detect(.data[[args[4]]], "FO|SS") & CHM > 5.0 ~ "FSW",
+                        str_detect(.data[[args[4]]], "PFO") & !str_detect(.data[[args[4]]], "SS|EM") & CHM >= 1.0 & CHM <= 5.0 ~ "SSW",
+                        str_detect(.data[[args[4]]], "PFO") & !str_detect(.data[[args[4]]], "SS|EM") & CHM > 5.0 ~ "FSW",
+                        str_detect(.data[[args[4]]], "PFO") & str_detect(.data[[args[4]]], "SS|EM") & CHM <= 3.5 ~ "EMW",
+                        str_detect(.data[[args[4]]], "PFO") & str_detect(.data[[args[4]]], "SS|EM") & CHM >= 1.0 & CHM <= 5.0 ~ "SSW",
+                        str_detect(.data[[args[4]]], "PFO") & str_detect(.data[[args[4]]], "SS|EM") & CHM > 5.0 ~ "FSW",
+                        str_detect(.data[[args[4]]], "PSS") & str_detect(.data[[args[4]]], "FO") & CHM >= 1.0 & CHM <= 5.0 ~ "SSW",
+                        str_detect(.data[[args[4]]], "PSS") & str_detect(.data[[args[4]]], "FO") & CHM > 5.0 ~ "FSW",
+                        str_detect(.data[[args[4]]], "PSS") & str_detect(.data[[args[4]]], "EM") & CHM <= 3.5 ~ "EMW",
+                        str_detect(.data[[args[4]]], "PSS") & str_detect(.data[[args[4]]], "EM") & CHM > 3.5 & CHM <= 5.0 ~ "SSW",
+                        str_detect(.data[[args[4]]], "PEM") & str_detect(.data[[args[4]]], "SS") & CHM <= 3.5 ~ "EMW",
+                        str_detect(.data[[args[4]]], "PEM") & str_detect(.data[[args[4]]], "SS") & CHM > 3.5 & CHM <= 5.0 ~ "SSW",
                         .default = "REVIEW"
                     ))
             print(unique(wet_chm$MOD_CLASS))
@@ -135,9 +137,13 @@ options(future.globals.maxSize= 16 * 1e9)
 
 plan(future.callr::callr, workers = corenum)
 
-system.time({future_lapply(huc_nums_cluster, wetland_chm_extract_classify, future.seed=TRUE)})
+system.time({future_lapply(huc_nums_cluster, 
+                           wetland_chm_extract_classify, 
+                           future.seed=TRUE,
+                           future.packages = c("terra", "sf", "tidyverse", "future", "future.lapply"),
+                           future.globals = TRUE)})
 
-# lapply(huc_nums_cluster[1:3], wetland_chm_extract_classify)
+# lapply(huc_nums_cluster, wetland_chm_extract_classify)
 
 # rm(wetlands)
 # rm(wetlands_filter)

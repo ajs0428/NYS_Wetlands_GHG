@@ -25,7 +25,7 @@ for number in "${include[@]}"; do
     "$number" \
     "Data/Training_Data/02_Done_Reviewed_NWI_Data/"
     128 \
-    "FALSE" >> "Shell_Scripts/logs/patch_$(date +%Y%m%d).log" 2>&1
+    "TRUE" >> "Shell_Scripts/logs/patch_$(date +%Y%m%d).log" 2>&1
     
 done
 
