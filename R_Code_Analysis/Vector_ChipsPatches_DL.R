@@ -43,21 +43,7 @@ fct_df <- data.frame(ID = 0:4, MOD_CLASS = c("EMW", "FSW", "OWW", "SSW", "UPL"))
 patchsize = as.numeric(args[3])
 ########################################################################################
 set.seed(420)
-filter_min_distance <- function(points, min_dist = patchsize*4) {
-    n <- nrow(points)
-    keep <- rep(TRUE, n)
-    
-    for (i in 1:(n - 1)) {
-        if (keep[i]) {
-            too_close <- st_is_within_distance(points[i, ], points[(i + 1):n, ], dist = min_dist)[[1]]
-            if (length(too_close) > 0) {
-                keep[(i + too_close)] <- FALSE
-            }
-        }
-    }
-    
-    points[keep, ]
-}
+
 vect_chip_patch_create <- function(wetland_file){
     ## Setup vars
     if(grepl("NWI", basename(wetland_file))){
@@ -67,9 +53,9 @@ vect_chip_patch_create <- function(wetland_file){
     } else if(grepl("Laba", basename(wetland_file))){
         sourceWetlands <- "Laba"
     } else {
-        sourceWetlands <- "Other"
+        sourceWetlands <- sub("_.*", "", tools::file_path_sans_ext(basename(wetland_file)))
     }
-    
+    message(sourceWetlands)
     huc_num <- str_extract(wetland_file, "(?<=huc_)\\d+")
     huc_poly <- sf::st_read("Data/NY_HUCS/NY_Cluster_Zones_250_NAomit_6347.gpkg", quiet = TRUE,
                                   query = paste0("SELECT * FROM NY_Cluster_Zones_250_NAomit_6347 WHERE huc12 = '", huc_num, "'"))
@@ -78,13 +64,20 @@ vect_chip_patch_create <- function(wetland_file){
     tw_centroid <- st_centroid(target_wetlands) |> st_geometry() |> st_cast(to = "MULTIPOINT") #centroid cast to multipoint
     
     tw_boundary <- st_boundary(target_wetlands) |> st_cast("LINESTRING") # cast to linestring
-    # perimeter <- st_length(tw_boundary)
-    # n_points <- pmax(0, as.integer(perimeter / 500)) # Divide the perimeter by 500m, round to nearest integer
-    tw_b_line <- st_line_sample(tw_boundary, density = 1/500) # put n_points on the border
+    tw_b_line <- st_line_sample(tw_boundary, density = 1/512) # put n_points on the border
     
     tw_bl_point <- st_cast(tw_b_line, "POINT")
     tw_bl_point <- tw_bl_point[!st_is_empty(tw_bl_point)]
+    tw_bl_point <- tw_bl_point[rowSums(st_is_within_distance(tw_bl_point,
+                                                           dist = 128,
+                                                           sparse = FALSE,
+                                                           remove_self = T)) == 0,] # filter out points that are too close
     tw_c_point <- st_cast(tw_centroid, "POINT")
+    
+    tw_c_point <- tw_c_point[rowSums(st_is_within_distance(tw_c_point,
+                                                               dist = 128,
+                                                               sparse = FALSE,
+                                                               remove_self = T)) == 0,] # filter out points that are too close
 
     ### upland points and bounding boxes
     rand_pts <- st_sample(huc_poly, 10)
@@ -101,24 +94,26 @@ vect_chip_patch_create <- function(wetland_file){
     target_wetlands_uplands <- bind_rows(upl_pts_box, target_wetlands)
     
     ###combine points
+    print(length(tw_bl_point))
+    print(length(tw_c_point))
+    print(length(upl_pts))
     tw_bl_c_cmb <- rbind(
         st_sf(geometry = tw_bl_point),
         st_sf(geometry = tw_c_point),
         st_sf(geometry = upl_pts)
     )
     
-    tw_bl_c_cmb_f <- filter_min_distance(tw_bl_c_cmb, patchsize*2) # filter out points that are too close
-    tw_bl_c_cmbbuff <- st_buffer(tw_bl_c_cmb_f, dist = patchsize, endCapStyle = "SQUARE") 
-    st_geometry(tw_bl_c_cmbbuff) <- "geom"   
+    tw_bl_c_cmbbuff <- st_buffer(tw_bl_c_cmb, dist = patchsize, endCapStyle = "SQUARE")
+    st_geometry(tw_bl_c_cmbbuff) <- "geom"
+    tw_bl_c_cmbbuff_o <- tw_bl_c_cmbbuff[rowSums(st_overlaps(tw_bl_c_cmbbuff, sparse = F)) == 0, ]
     
-
     #### Vector polygon patches
 
-    for(i in seq_len(nrow(tw_bl_c_cmbbuff))){
+    for(i in seq_len(nrow(tw_bl_c_cmbbuff_o))){
         fn_vector <- paste0("Data/R_Patches_Vector/", sourceWetlands,"_cluster_", args[1], "_huc_", huc_num, "_patch_", i, "_", patchsize*2, "m.gpkg" )
         if(!file.exists(fn_vector)){
-            wet_patch <-  st_intersection(target_wetlands_uplands, tw_bl_c_cmbbuff[i,])
-            upl_patch <- st_difference(tw_bl_c_cmbbuff[i,] |>
+            wet_patch <-  st_intersection(target_wetlands_uplands, tw_bl_c_cmbbuff_o[i,])
+            upl_patch <- st_difference(tw_bl_c_cmbbuff_o[i,] |>
                                        mutate(MOD_CLASS = "UPL"),
                                    st_union(target_wetlands_uplands))
             st_geometry(upl_patch) <- "geom"
@@ -128,50 +123,51 @@ vect_chip_patch_create <- function(wetland_file){
                    BoundariesAltered = NA,
                    Comments = "NoComment") |>
             dplyr::select(ReviewerName, Confidence, BoundariesAltered, Comments, MOD_CLASS)
-            
+
             st_write(wetupl_patch, dsn = fn_vector, append = FALSE)
-            
-            if(file.exists(logpath)){
-                logfile <- read_csv(logpath, show_col_types = FALSE)
-                fn_to_add <- logfile |> filter(patch_file_name == basename(fn_vector))
-                if(nrow(fn_to_add) == 0){
-                    fn_to_add_row <- data.frame(patch_file_name = basename(fn_vector),
-                                            reviewer = "NAME",
-                                            boundaries_altered = "TBD",
-                                            confidence = "TBD")
-                    # update_logfile <- bind_rows(fn_to_add_row, logfile)
-                    write_csv(fn_to_add_row, logpath, append = TRUE)
-                    } else {
-                        message("Filename in log file")
-                    }
-                }
+
+            # if(!file.exists(logpath)){
+            #     logfile <- read_csv(logpath, show_col_types = FALSE)
+            #     fn_to_add <- logfile |> filter(patch_file_name == basename(fn_vector))
+            #     if(nrow(fn_to_add) == 0){
+            #         fn_to_add_row <- data.frame(patch_file_name = basename(fn_vector),
+            #                                 reviewer = "NAME",
+            #                                 boundaries_altered = "TBD",
+            #                                 confidence = "TBD")
+            #         # update_logfile <- bind_rows(fn_to_add_row, logfile)
+            #         write_csv(fn_to_add_row, logpath, append = TRUE)
+            #         } else {
+            #             message("Filename in log file")
+            #         }
+            #     }
 
         } else {
         message("Already file ", fn_vector)
             }
        }
-    
+
     fn_full_patch <- paste0("Data/R_Patches_Vector/", sourceWetlands,"_cluster_", args[1], "_huc_", huc_num, "_", patchsize*2, "m.gpkg" )
-    if(file.exists(fn_full_patch)){
-        full_patch_file <- list.files("Data/R_Patches_Vector/", 
-                                      full.names = TRUE, 
-                                      pattern = paste0("_cluster_", args[1], "_huc_", huc_num, "_", "patch.*\\.gpkg$")) |> 
-            purrr::map(st_read, quiet = TRUE) |> 
+    if(!file.exists(fn_full_patch)){
+        full_patch_file <- list.files("Data/R_Patches_Vector/",
+                                      full.names = TRUE,
+                                      pattern = paste0("_cluster_", args[1], "_huc_", huc_num, "_", "patch.*\\.gpkg$")) |>
+            purrr::map(st_read, quiet = TRUE) |>
             bind_rows()
-        st_write(full_patch_file, 
-                 dsn =  paste0("Data/R_Patches_Vector/", sourceWetlands,"_cluster_", args[1], "_huc_", huc_num, "_", patchsize*2, "m.gpkg" ),
-                 append = TRUE)
-    } else {
-        full_patch_file <- list.files("Data/R_Patches_Vector/", 
-                                      full.names = TRUE, 
-                                      pattern = paste0("_cluster_", args[1], "_huc_", huc_num, "_", "patch.*\\.gpkg$")) |> 
-            purrr::map(st_read, quiet = TRUE) |> 
-            bind_rows()
-        st_write(full_patch_file, 
+        st_write(full_patch_file,
                  dsn =  paste0("Data/R_Patches_Vector/", sourceWetlands,"_cluster_", args[1], "_huc_", huc_num, "_", patchsize*2, "m.gpkg" ),
                  append = FALSE)
+    } else {
+        # full_patch_file <- list.files("Data/R_Patches_Vector/",
+        #                               full.names = TRUE,
+        #                               pattern = paste0("_cluster_", args[1], "_huc_", huc_num, "_", "patch.*\\.gpkg$")) |>
+        #     purrr::map(st_read, quiet = TRUE) |>
+        #     bind_rows()
+        # st_write(full_patch_file,
+        #          dsn =  paste0("Data/R_Patches_Vector/", sourceWetlands,"_cluster_", args[1], "_huc_", huc_num, "_", patchsize*2, "m.gpkg" ),
+        #          append = FALSE)
+        message("Already file")
     }
-        
+
     return(NULL)
 
 }
