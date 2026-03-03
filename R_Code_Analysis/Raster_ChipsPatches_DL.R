@@ -82,7 +82,7 @@ rast_chip_patch_create <- function(wetland_file){
     } else if (grepl("Laba", basename(wetland_file))) {
         sourceWetlands <- "Laba"
     } else {
-        sourceWetlands <- "Other"
+        sourceWetlands <- sub("_.*", "", tools::file_path_sans_ext(basename(wetland_file)))
     }
     patchsize = as.numeric(args[2])
     huc_num <- str_extract(wetland_file, "(?<=huc_)\\d+")

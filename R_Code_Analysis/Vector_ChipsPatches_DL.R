@@ -9,15 +9,15 @@ library(tidyterra)
 library(readr)
 library(future)
 library(future.apply)
-
+library(purrr)
 
 set.seed(11)
 
 ########################################################################################
 
 args <- c(
-    208,
-    "Data/Training_Data/TompkinsCounty_Reclass/", #Path to wetland polygons
+    225,
+    "Data/Training_Data/ADK_HUC_Processed/", #Path to wetland polygons
     128 # Patch size radius
 )
 
@@ -32,7 +32,7 @@ cat("these are the arguments: \n",
 
 setGDALconfig("GDAL_PAM_ENABLED", "FALSE") # does not create aux.xml files but maybe needed
 ########################################################################################
-l_wet <- list.files(args[2], pattern = ".gpkg$", full.names = TRUE) 
+l_wet <- list.files(args[2], pattern = ".gpkg$", full.names = TRUE) |> keep(\(x) str_detect(x, "ADK_WCT"))
 l_wet_cluster <- l_wet[str_detect(l_wet, paste0("cluster_", args[1]))]
 
 print(l_wet_cluster)
@@ -52,6 +52,10 @@ vect_chip_patch_create <- function(wetland_file){
         sourceWetlands <- "NHP"
     } else if(grepl("Laba", basename(wetland_file))){
         sourceWetlands <- "Laba"
+    } else if(grepl("ADK_WCT", basename(wetland_file))){
+        sourceWetlands <- "ADK_WCT"
+    } else if(grepl("ADK_regulated", basename(wetland_file))){
+        sourceWetlands <- "ADK_regulated"
     } else {
         sourceWetlands <- sub("_.*", "", tools::file_path_sans_ext(basename(wetland_file)))
     }
@@ -110,7 +114,7 @@ vect_chip_patch_create <- function(wetland_file){
     #### Vector polygon patches
 
     for(i in seq_len(nrow(tw_bl_c_cmbbuff_o))){
-        fn_vector <- paste0("Data/R_Patches_Vector/", sourceWetlands,"_cluster_", args[1], "_huc_", huc_num, "_patch_", i, "_", patchsize*2, "m.gpkg" )
+        fn_vector <- paste0("Data/R_Patches_Vector/individual_patches/", sourceWetlands,"_cluster_", args[1], "_huc_", huc_num, "_patch_", i, "_", patchsize*2, "m.gpkg" )
         if(!file.exists(fn_vector)){
             wet_patch <-  st_intersection(target_wetlands_uplands, tw_bl_c_cmbbuff_o[i,])
             upl_patch <- st_difference(tw_bl_c_cmbbuff_o[i,] |>
@@ -148,7 +152,7 @@ vect_chip_patch_create <- function(wetland_file){
 
     fn_full_patch <- paste0("Data/R_Patches_Vector/", sourceWetlands,"_cluster_", args[1], "_huc_", huc_num, "_", patchsize*2, "m.gpkg" )
     if(!file.exists(fn_full_patch)){
-        full_patch_file <- list.files("Data/R_Patches_Vector/",
+        full_patch_file <- list.files("Data/R_Patches_Vector/individual_patches/",
                                       full.names = TRUE,
                                       pattern = paste0("_cluster_", args[1], "_huc_", huc_num, "_", "patch.*\\.gpkg$")) |>
             purrr::map(st_read, quiet = TRUE) |>
@@ -191,7 +195,7 @@ future_lapply(l_wet_cluster, vect_chip_patch_create,
               future.globals = TRUE)
 
 ### Non-parallel
-# system.time({lapply(l_wet_cluster, vect_chip_patch_create)})
+# system.time({lapply(l_wet_cluster[[1]], vect_chip_patch_create)})
 
 
 #### Checks

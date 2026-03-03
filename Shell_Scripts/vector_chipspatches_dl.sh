@@ -4,9 +4,9 @@
 #SBATCH --mail-type=ALL
 #SBATCH --mem-per-cpu=24G
 #SBATCH --cpus-per-task=4
-#SBATCH --job-name=patch
+#SBATCH --job-name=vector-patch
 #SBATCH --ntasks=2
-#SBATCH --output=Shell_Scripts/SLURM/slurm-patch-%j.out
+#SBATCH --output=Shell_Scripts/SLURM/slurm-vector-patch-%j.out
 
 
 cd /ibstorage/anthony/NYS_Wetlands_GHG/
@@ -21,11 +21,10 @@ include=(11 12 22 51 53 56 60 64 67 84 86 90 92 102 105 116 120 123 136 138 152 
 # Loop through each number in the list
 for number in "${include[@]}"; do
     echo "Running Rscript with argument: $number"
-    Rscript R_Code_Analysis/Image_ChipsPatches_DL.R \
+    Rscript R_Code_Analysis/Vector_ChipsPatches_DL.R \
     "$number" \
-    "Data/Training_Data/02_Done_Reviewed_NWI_Data/"
-    128 \
-    "TRUE" >> "Shell_Scripts/logs/patch_$(date +%Y%m%d).log" 2>&1
+    "Data/Training_Data/ADK_HUC_Processed/" \
+    128 >> "Shell_Scripts/logs/vector_patch_$(date +%Y%m%d).log" 2>&1
     
 done
 
