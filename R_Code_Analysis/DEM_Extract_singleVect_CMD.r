@@ -7,7 +7,7 @@
 
 args = c("Data/NYS_DEM_Indexes/",
          "Data/NY_HUCS/NY_Cluster_Zones_250_NAomit.gpkg",
-         120,
+         123,
          "Data/DEMs/",
          "Data/TerrainProcessed/HUC_DEMs"
          )
@@ -41,7 +41,8 @@ terraOptions(
 ###############################################################################################
 
 # A shapefile list of all the DEM indexes (vector tiles of the actual DEM locations)
-dem_ind_list <- (lapply(list.files(args[1], pattern = "^dem_1_meter.*\\.shp$|USGS_LakeOntarioHudsonRiverRegion2022|FEMA_Bare_Earth_DEM_1m.shp",full.names = TRUE), sf::st_read, quiet = TRUE))
+dem_ind_list <- (lapply(list.files(args[1], pattern = "^dem_1_meter.*\\.shp$|USGS_LakeOntarioHudsonRiverRegion2022|FEMA_Bare_Earth_DEM_1m.shp",full.names = TRUE), 
+                        sf::st_read, quiet = TRUE))
 
 
 transform_sf <- function(stl){

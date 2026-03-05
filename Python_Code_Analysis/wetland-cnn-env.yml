@@ -11,3 +11,4 @@ dependencies:
   - matplotlib
   - scikit-learn
   - ipykernel
+prefix: /workdir/ajs544/miniconda3/envs/wetland-cnn

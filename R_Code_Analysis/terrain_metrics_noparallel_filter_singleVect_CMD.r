@@ -146,26 +146,26 @@ message(paste0("Found ", length(list_of_huc_dems), " DEMs to process"))
 
 ###############################################################################################
 
-if(future::availableCores() > 16){
-    corenum <-  4
-} else {
-    corenum <-  (future::availableCores())
-}
-options(future.globals.maxSize= 48.0 * 1e9)
-# plan(multisession, workers = corenum)
-plan(future.callr::callr)
+# if(future::availableCores() > 16){
+#     corenum <-  4
+# } else {
+#     corenum <-  (future::availableCores())
+# }
+# options(future.globals.maxSize= 48.0 * 1e9)
+# # plan(multisession, workers = corenum)
+# plan(future.callr::callr)
+# 
+# future_lapply(
+#     list_of_huc_dems,
+#     terrain_function,
+#     metric = args[3],
+#     future.seed = TRUE,
+#     future.scheduling = 1.0  # Dynamic load balancing
+# )
 
-future_lapply(
-    list_of_huc_dems,
-    terrain_function,
-    metric = args[3],
-    future.seed = TRUE,
-    future.scheduling = 1.0  # Dynamic load balancing
-)
-
-# lapply(list_of_huc_dems[1],
-#        terrain_function,
-#        metric = args[3])
+lapply(list_of_huc_dems,
+       terrain_function,
+       metric = args[3])
 # 
 # r <- rast("Data/TerrainProcessed/HUC_DEMs/cluster_120_huc_020200060609.tif")
 # 
