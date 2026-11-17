@@ -18,9 +18,10 @@ Python_Code_Analysis/raster_footprint*
 R_Code_Analysis/*/
 # Python_Code_Analysis/
 # except the DL stuff now
-!Python_Code_Analysis/DL_Learning/*.ipynb
-!Python_Code_Analysis/DL_Learning/*.py
+!Python_Code_Analysis/*.ipynb
+!Python_Code_Analysis/*.py
 
+!README.md
 !.gitignore
 !.gitattributes
 !.Rproj
