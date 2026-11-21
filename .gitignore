@@ -16,6 +16,7 @@ Python_Code_Analysis/raster_footprint*
 !Data/
 !Data/GHG/
 !Data/GHG/*.csv
+!Data/GHG/*.gpkg
 
 # Ignore directories in directories (probably quarto stuff)
 R_Code_Analysis/*/
