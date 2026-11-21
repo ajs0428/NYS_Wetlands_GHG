@@ -13,6 +13,9 @@
 !Shell_Scripts/*.sh
 R_Code_Analysis/raster_footprint*
 Python_Code_Analysis/raster_footprint*
+!Data/
+!Data/GHG/
+!Data/GHG/*.csv
 
 # Ignore directories in directories (probably quarto stuff)
 R_Code_Analysis/*/
