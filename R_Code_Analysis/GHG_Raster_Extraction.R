@@ -38,8 +38,11 @@ suppressPackageStartupMessages({
 ## --- Settings ---------------------------------------------------------------
 DATA_ROOT <- "/ibstorage/anthony/NYS_Wetlands_Data"
 PROD_PROBS <- "/ibstorage/anthony/NYS_Wetlands_Prod/Data/HUC_DL_Predictions_Prod/p027_focal_bin_p21/ensemble_cal"
-SITES <- "Data/GHG/NYDEC_GHG_Sites_6347.gpkg"
-HUC_ZONES <- file.path(DATA_ROOT, "Data/NY_HUCS/NY_Cluster_Zones_250_CROP_NAomit_6347.gpkg")
+SITES <- "Data/GHG/NYDEC_GHG_all_site_data_GPSupd_6347.gpkg"
+HUC_ZONES <- file.path(
+  DATA_ROOT,
+  "Data/NY_HUCS/NY_Cluster_Zones_250_CROP_NAomit_6347.gpkg"
+)
 OUT_CSV <- "Data/GHG/NYDEC_GHG_Site_RasterPredictors.csv"
 
 CELL <- 10 # map resolution (m) = aggregation factor on the 1 m grid
@@ -47,9 +50,16 @@ WINDOWS <- c(10, 30, 50) # window widths (m); odd multiples of CELL
 
 ## Curated predictors: band name in the huc_stack.R layers -> output prefix
 BANDS <- c(
-  DEM = "DEM", twi = "twi", hand = "HAND", CHM = "CHM",
-  TPI_local = "TPI", dmv_local = "DMV",
-  ndvi = "NDVI", ndwi = "NDWI", ndvi_lo = "NDVI_lo", ndwi_lo = "NDWI_lo",
+  DEM = "DEM",
+  twi = "twi",
+  hand = "HAND",
+  CHM = "CHM",
+  TPI_local = "TPI",
+  dmv_local = "DMV",
+  ndvi = "NDVI",
+  ndwi = "NDWI",
+  ndvi_lo = "NDVI_lo",
+  ndwi_lo = "NDWI_lo",
   WET_prob = "WETprob"
 )
 
@@ -68,9 +78,15 @@ sites <- st_read(SITES, quiet = TRUE) |>
 
 zones <- st_read(HUC_ZONES, quiet = TRUE) |> select(huc12, cluster)
 sites <- st_join(sites, zones, join = st_within)
-if (anyDuplicated(sites$Site_ID)) stop("A site falls in more than one HUC zone")
-if (anyNA(sites$huc12)) stop("Sites outside HUC zones: ",
-                             paste(sites$Site_ID[is.na(sites$huc12)], collapse = ", "))
+if (anyDuplicated(sites$Site_ID)) {
+  stop("A site falls in more than one HUC zone")
+}
+if (anyNA(sites$huc12)) {
+  stop(
+    "Sites outside HUC zones: ",
+    paste(sites$Site_ID[is.na(sites$huc12)], collapse = ", ")
+  )
+}
 message(nrow(sites), " sites in ", n_distinct(sites$huc12), " HUC12s")
 
 ## --- One site -----------------------------------------------------------------
@@ -78,17 +94,29 @@ message(nrow(sites), " sites in ", n_distinct(sites$huc12), " HUC12s")
 ## every band, then summarizes each nested window.
 extract_site <- function(x, y, huc, cluster) {
   paths <- huc_source_paths(huc, cluster, dirs = abs_dirs, profile = "prod")
-  if (!huc_sources_ready(paths, huc)) stop("Missing sources for HUC ", huc)
+  if (!huc_sources_ready(paths, huc)) {
+    stop("Missing sources for HUC ", huc)
+  }
   # Open sources directly rather than via huc_layers(): it log-transforms
   # flowacc over the whole HUC (eager, minutes per HUC), and flowacc is unused.
-  pick1 <- \(f) { if (length(f) > 1) message("  multiple files, using ", basename(f[1])); f[1] }
+  pick1 <- \(f) {
+    if (length(f) > 1) {
+      message("  multiple files, using ", basename(f[1]))
+    }
+    f[1]
+  }
   lyrs <- lapply(paths, \(f) rast(pick1(f)))
   names(lyrs$dem) <- "DEM"
   names(lyrs$hand) <- "hand"
   names(lyrs$ortho) <- paste0(names(lyrs$ortho), "_lo")
 
-  prob_f <- file.path(PROD_PROBS, sprintf("DLpred_binary_cluster_%s_huc_%s_probs.tif", cluster, huc))
-  if (!file.exists(prob_f)) stop("No probability map: ", prob_f)
+  prob_f <- file.path(
+    PROD_PROBS,
+    sprintf("DLpred_binary_cluster_%s_huc_%s_probs.tif", cluster, huc)
+  )
+  if (!file.exists(prob_f)) {
+    stop("No probability map: ", prob_f)
+  }
   prob <- rast(prob_f)[[1]] # band 1 = WET probability (calibrated)
   names(prob) <- "WET_prob"
 
@@ -99,14 +127,28 @@ extract_site <- function(x, y, huc, cluster) {
   col <- floor((x - x0) / CELL)
   row <- floor((y0 - y) / CELL)
   k <- (max(WINDOWS) / CELL - 1) / 2
-  e <- ext(x0 + (col - k) * CELL, x0 + (col + k + 1) * CELL,
-           y0 - (row + k + 1) * CELL, y0 - (row - k) * CELL)
+  e <- ext(
+    x0 + (col - k) * CELL,
+    x0 + (col + k + 1) * CELL,
+    y0 - (row + k + 1) * CELL,
+    y0 - (row - k) * CELL
+  )
 
   grab <- function(r) extend(crop(r, e, snap = "near"), e) # NA-pad at raster edge
   ortho <- ortho_lo_indices(grab(lyrs$ortho))
-  stk <- c(grab(lyrs$dem), grab(lyrs$terr), grab(lyrs$hydro), grab(lyrs$hand),
-           grab(lyrs$chm), grab(lyrs$naip), ortho, grab(prob))
-  if (!compareGeom(stk, grab(ref), stopOnError = FALSE)) stop("Grid mismatch in HUC ", huc)
+  stk <- c(
+    grab(lyrs$dem),
+    grab(lyrs$terr),
+    grab(lyrs$hydro),
+    grab(lyrs$hand),
+    grab(lyrs$chm),
+    grab(lyrs$naip),
+    ortho,
+    grab(prob)
+  )
+  if (!compareGeom(stk, grab(ref), stopOnError = FALSE)) {
+    stop("Grid mismatch in HUC ", huc)
+  }
   stk <- stk[[names(BANDS)]]
 
   side <- (2 * k + 1) * CELL # pixels per side of the largest window
@@ -124,14 +166,16 @@ extract_site <- function(x, y, huc, cluster) {
     idx <- (side / 2 - half + 1):(side / 2 + half)
     sub <- arr[idx, idx, , drop = FALSE]
     for (b in seq_along(BANDS)) {
-      v <- sub[, , b]
+      v <- sub[,, b]
       v <- v[is.finite(v)]
       m <- if (length(v)) mean(v) else NA_real_
       out[[sprintf("%s_mean_%dm", BANDS[[b]], w)]] <- m
       out[[sprintf("%s_sd_%dm", BANDS[[b]], w)]] <-
         if (length(v)) sqrt(max(mean(v^2) - m^2, 0)) else NA_real_
     }
-    out[[sprintf("validfrac_%dm", w)]] <- mean(apply(sub, c(1, 2), \(p) all(is.finite(p))))
+    out[[sprintf("validfrac_%dm", w)]] <- mean(apply(sub, c(1, 2), \(p) {
+      all(is.finite(p))
+    }))
   }
   as_tibble(out)
 }
@@ -139,7 +183,13 @@ extract_site <- function(x, y, huc, cluster) {
 ## --- Run ------------------------------------------------------------------------
 xy <- st_coordinates(sites)
 res <- lapply(seq_len(nrow(sites)), function(i) {
-  message(sprintf("[%2d/%d] %s (HUC %s)", i, nrow(sites), sites$Site_ID[i], sites$huc12[i]))
+  message(sprintf(
+    "[%2d/%d] %s (HUC %s)",
+    i,
+    nrow(sites),
+    sites$Site_ID[i],
+    sites$huc12[i]
+  ))
   extract_site(xy[i, 1], xy[i, 2], sites$huc12[i], sites$cluster[i])
 })
 

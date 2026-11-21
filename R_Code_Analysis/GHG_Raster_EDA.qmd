@@ -61,9 +61,9 @@ library(here)
 ## --- Settings ---------------------------------------------------------------
 RASTER_CSV <- here("Data/GHG/NYDEC_GHG_Site_RasterPredictors.csv")
 CLIMATE_CSV <- here("Data/GHG/NYDEC_GHG_Site_Climate.csv")
-SITES_GPKG <- here("Data/GHG/NYDEC_GHG_Sites_6347.gpkg")
+SITES_GPKG <- here("Data/GHG/NYDEC_GHG_all_site_data_GPSupd_6347.gpkg")
 
-FOCAL_WINDOW <- 30 # window (m) used for the detailed single-window plots
+FOCAL_WINDOW <- 10 # window (m) used for the detailed single-window plots
 COR_FLAG <- 0.7 # |rho| treated as "highly correlated"
 VIF_FLAG <- 5 # VIF treated as problematic
 CH4_SIGMA <- 0.01 # pseudo-log linear range for CH4 axes
