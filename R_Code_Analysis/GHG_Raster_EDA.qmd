@@ -1,5 +1,5 @@
 ---
-title: "GHG flux vs. raster predictors: exploratory analysis"
+title: "GHG flux vs. raster and climate predictors: exploratory analysis"
 subtitle: "Multicollinearity among predictors and univariate flux relationships"
 date: today
 format:
@@ -21,12 +21,16 @@ execute:
 This notebook explores `Data/GHG/NYDEC_GHG_Site_RasterPredictors.csv`, made by
 `R_Code_Analysis/GHG_Raster_Extraction.R`. It has one row per site (48 sites),
 with the mean and SD of 11 raster bands in 10, 30 and 50 m windows around each
-chamber site. It covers:
+chamber site. It also uses the climate variables in
+`Data/GHG/NYDEC_GHG_Site_Climate.csv`, made by
+`Python_Code_Analysis/GHG_Climate_Extraction.ipynb`: ERA5-Land weather for the
+14 days before each visit, and PRISM 1991–2020 normals. The notebook covers:
 
 1. **Inter-correlations among predictors**, as a multicollinearity check. This
-   includes whether the three window sizes add any distinct information.
-2. **Univariate relationships** between CH4 and CO2 flux and each raster
-   predictor.
+   includes whether the three window sizes add any distinct information, and
+   how the climate variables relate to each other and to the raster predictors.
+2. **Univariate relationships** between CH4 and CO2 flux and each raster and
+   climate predictor.
 
 Model fitting, and the spatial autocorrelation check on model residuals, will go
 in a separate modeling notebook once we choose a model structure.
@@ -56,6 +60,7 @@ library(here)
 
 ## --- Settings ---------------------------------------------------------------
 RASTER_CSV <- here("Data/GHG/NYDEC_GHG_Site_RasterPredictors.csv")
+CLIMATE_CSV <- here("Data/GHG/NYDEC_GHG_Site_Climate.csv")
 SITES_GPKG <- here("Data/GHG/NYDEC_GHG_Sites_6347.gpkg")
 
 FOCAL_WINDOW <- 30 # window (m) used for the detailed single-window plots
@@ -66,6 +71,27 @@ CH4_SIGMA <- 0.01 # pseudo-log linear range for CH4 axes
 ## Band order from GHG_Raster_Extraction.R
 BAND_ORDER <- c("DEM", "twi", "HAND", "CHM", "TPI", "DMV",
                 "NDVI", "NDWI", "NDVI_lo", "NDWI_lo", "WETprob")
+
+## Climate predictors (Python_Code_Analysis/GHG_Climate_Extraction.ipynb):
+## column -> short label. anom_* are derived below.
+CLIM_VARS <- c(
+  era5_temperature_2m_14d          = "ERA5 Tmean 14d",
+  era5_temperature_2m_max_14d      = "ERA5 Tmax 14d",
+  era5_temperature_2m_min_14d      = "ERA5 Tmin 14d",
+  era5_total_precipitation_sum_14d = "ERA5 Precip 14d",
+  anom_tmean_14d                   = "Tmean anomaly 14d",
+  anom_ppt_14d                     = "Precip anomaly 14d",
+  prism_tmean_month                = "PRISM Tmean month",
+  prism_tmax_month                 = "PRISM Tmax month",
+  prism_tmin_month                 = "PRISM Tmin month",
+  prism_ppt_month                  = "PRISM Precip month",
+  prism_tmean_annual               = "PRISM Tmean annual",
+  prism_tmax_annual                = "PRISM Tmax annual",
+  prism_tmin_annual                = "PRISM Tmin annual",
+  prism_ppt_annual                 = "PRISM Precip annual"
+)
+## Variables that change with the sampling date (vs. static annual normals)
+CLIM_DATED <- names(CLIM_VARS)[!grepl("_annual$", names(CLIM_VARS))]
 
 ## --- Plot styling -----------------------------------------------------------
 ## Categorical slots 1-3 (validated for colorblind separation); wetland type
@@ -126,13 +152,31 @@ flux_site <- flux_round |>
     .groups = "drop"
   )
 
+## Climate is per visit: ERA5 = 14 days before the sample date; PRISM month =
+## 1991-2020 normal for the sample month. Anomalies compare the two (rough:
+## ERA5 ~11 km vs PRISM ~800 m; monthly precip normal scaled to 14 days).
+clim_round <- read.csv(CLIMATE_CSV) |>
+  mutate(
+    anom_tmean_14d = era5_temperature_2m_14d - prism_tmean_month,
+    anom_ppt_14d = era5_total_precipitation_sum_14d - prism_ppt_month * 14 / 30.4
+  ) |>
+  select(Site_ID, Round_Number, all_of(names(CLIM_VARS)))
+
+## Site mean of the two visits, matching the flux response
+clim_site <- clim_round |>
+  group_by(Site_ID) |>
+  summarise(across(all_of(names(CLIM_VARS)), mean), .groups = "drop")
+
 stopifnot(
   !anyDuplicated(rast$Site_ID),
-  setequal(rast$Site_ID, flux_site$Site_ID)
+  setequal(rast$Site_ID, flux_site$Site_ID),
+  setequal(clim_site$Site_ID, flux_site$Site_ID),
+  !anyNA(clim_site)
 )
 
 dat <- rast |>
   left_join(flux_site, by = "Site_ID") |>
+  left_join(clim_site, by = "Site_ID") |>
   mutate(
     Wetland_Type = factor(Wetland_Type, levels = names(WT_COLS)),
     Ecoregion = factor(Ecoregion)
@@ -152,9 +196,21 @@ pred_info <- tibble(col = pred_cols) |>
   arrange(window, stat, band) |>
   mutate(feature = factor(feature, levels = unique(feature)))
 
+clim_info <- tibble(col = names(CLIM_VARS), label = unname(CLIM_VARS)) |>
+  mutate(
+    source = case_when(
+      startsWith(col, "era5") ~ "ERA5 14-day",
+      startsWith(col, "anom") ~ "Anomaly (ERA5 - PRISM month)",
+      endsWith(col, "_month") ~ "PRISM month normal",
+      TRUE ~ "PRISM annual normal"
+    ),
+    label = factor(label, levels = label)
+  )
+
 cat(nrow(dat), "sites;", length(pred_cols), "raster predictors (",
     nlevels(pred_info$band), "bands x 2 stats x",
-    n_distinct(pred_info$window), "windows )\n")
+    n_distinct(pred_info$window), "windows );",
+    nrow(clim_info), "climate predictors\n")
 ```
 
 The extraction also writes diagnostic columns that are not predictors.
@@ -199,6 +255,26 @@ if (nrow(low_info)) {
 } else {
   cat("No constant or near-constant predictors.\n")
 }
+```
+
+### Climate summaries
+
+Climate values are site means of the two visits. The annual normals are
+identical for both visits; the ERA5 and sample-month values differ by visit date.
+ERA5-Land is about 11 km resolution, so sites close together can share a cell
+(see `n_unique`).
+
+```{r clim-summary}
+dat |>
+  select(all_of(clim_info$col)) |>
+  pivot_longer(everything(), names_to = "col") |>
+  group_by(col) |>
+  summarise(min = min(value), median = median(value), max = max(value),
+            sd = sd(value), n_unique = n_distinct(round(value, 6)),
+            .groups = "drop") |>
+  right_join(clim_info, by = "col") |>
+  select(source, variable = label, min, median, max, sd, n_unique) |>
+  kable(digits = 2, caption = "Climate predictor summaries (site means, n = 48; °C and mm)")
 ```
 
 ## 2. Response distributions
@@ -321,8 +397,8 @@ cor_matrix <- function(w) {
   m
 }
 
-plot_cor_matrix <- function(w) {
-  m <- cor_matrix(w)
+## Clustered heatmap of any square correlation matrix
+plot_cor <- function(m, title) {
   ord <- hclust(as.dist(1 - abs(m)), method = "average")$order
   lv <- rownames(m)[ord]
   as_tibble(m, rownames = "x") |>
@@ -335,10 +411,13 @@ plot_cor_matrix <- function(w) {
               size = 2.4) +
     scale_fill_rho() +
     coord_fixed() +
-    labs(title = sprintf("Predictor inter-correlation, %d m window", w),
-         x = NULL, y = NULL) +
+    labs(title = title, x = NULL, y = NULL) +
     theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
           panel.grid = element_blank(), legend.position = "right")
+}
+
+plot_cor_matrix <- function(w) {
+  plot_cor(cor_matrix(w), sprintf("Predictor inter-correlation, %d m window", w))
 }
 ```
 
@@ -422,6 +501,15 @@ vif_of <- function(X) {
 
 vif_stepdown <- function(X, thresh = VIF_FLAG) {
   dropped <- tibble(step = integer(), dropped = character(), vif = numeric())
+  ## Columns that are exact linear combinations of earlier ones (VIF = Inf)
+  ## are removed first; pivoted QR keeps the earlier column of each alias set.
+  q <- qr(scale(X), tol = 1e-7)
+  if (q$rank < ncol(X)) {
+    aliased <- colnames(X)[q$pivot[-seq_len(q$rank)]]
+    dropped <- add_row(dropped, step = seq_along(aliased),
+                       dropped = paste(aliased, "(exact linear combination)"), vif = Inf)
+    X <- X[, setdiff(colnames(X), aliased), drop = FALSE]
+  }
   repeat {
     v <- vif_of(X)
     if (max(v) < thresh || ncol(X) <= 2) break
@@ -452,6 +540,82 @@ imap_dfr(vif_res, \(r, w) mutate(r$step$kept, window_m = w)) |>
             kept = paste(sprintf("%s (%.1f)", feature, vif), collapse = ", "),
             .groups = "drop") |>
   kable(caption = sprintf("Predictors that remain after VIF step-down to < %d (VIF in brackets)", VIF_FLAG))
+```
+
+### 3.6 Climate predictors
+
+**Among climate variables.** Within a product, the temperature variables
+(mean, max, min) are expected to be close to redundant.
+
+```{r clim-cor, fig.height=7, fig.width=8}
+clim_X <- as.matrix(dat[clim_info$col])
+colnames(clim_X) <- as.character(clim_info$label)
+clim_m <- cor(clim_X, method = "spearman")
+plot_cor(clim_m, "Climate predictor inter-correlation")
+```
+
+**Climate vs. raster predictors.** Climate varies smoothly over the state, and
+so do some raster bands (for example, DEM). Where a climate variable and a
+raster predictor are strongly correlated, they cannot be separated in a model.
+The heatmap uses the `r FOCAL_WINDOW` m window; cells are labelled where
+|ρ| ≥ `r COR_FLAG`.
+
+```{r clim-rast-cor, fig.height=6, fig.width=10}
+focal_info <- pred_info |> filter(window == FOCAL_WINDOW) |> arrange(stat, band)
+rast_X <- as.matrix(dat[focal_info$col])
+colnames(rast_X) <- as.character(focal_info$feature)
+
+cross_m <- cor(clim_X, rast_X, method = "spearman")
+
+as_tibble(cross_m, rownames = "climate") |>
+  pivot_longer(-climate, names_to = "raster", values_to = "rho") |>
+  mutate(climate = factor(climate, levels = rev(levels(clim_info$label))),
+         raster = factor(raster, levels = colnames(rast_X))) |>
+  ggplot(aes(raster, climate, fill = rho)) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  geom_text(aes(label = ifelse(abs(rho) >= COR_FLAG, sprintf("%.2f", rho), "")),
+            size = 2.4) +
+  scale_fill_rho() +
+  labs(title = sprintf("Climate vs. raster predictors (%d m window)", FOCAL_WINDOW),
+       x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        panel.grid = element_blank(), legend.position = "right")
+```
+
+```{r clim-high-pairs}
+clim_pairs <- bind_rows(
+  {
+    idx <- which(upper.tri(clim_m) & abs(clim_m) >= COR_FLAG, arr.ind = TRUE)
+    tibble(type = "climate-climate", var1 = rownames(clim_m)[idx[, 1]],
+           var2 = colnames(clim_m)[idx[, 2]], rho = clim_m[idx])
+  },
+  {
+    idx <- which(abs(cross_m) >= COR_FLAG, arr.ind = TRUE)
+    tibble(type = sprintf("climate-raster (%d m)", FOCAL_WINDOW),
+           var1 = rownames(cross_m)[idx[, 1]],
+           var2 = colnames(cross_m)[idx[, 2]], rho = cross_m[idx])
+  }
+) |>
+  arrange(type, desc(abs(rho)))
+
+kable(clim_pairs, digits = 2,
+      caption = sprintf("Climate pairs with |Spearman ρ| ≥ %.1f", COR_FLAG))
+```
+
+**Joint VIF.** This starts from the raster predictors that remained after the
+`r FOCAL_WINDOW` m VIF step-down (Section 3.5), adds all climate variables, and
+repeats the step-down.
+
+```{r clim-vif}
+rast_kept <- vif_res[[as.character(FOCAL_WINDOW)]]$step$kept$feature
+joint_step <- vif_stepdown(cbind(rast_X[, rast_kept, drop = FALSE], clim_X))
+
+kable(joint_step$dropped, digits = 1,
+      caption = "Dropped in order (VIF at the time of dropping)")
+joint_step$kept |>
+  mutate(type = ifelse(feature %in% clim_info$label, "climate", "raster")) |>
+  arrange(type, desc(vif)) |>
+  kable(digits = 1, caption = sprintf("Joint raster + climate set with all VIF < %d", VIF_FLAG))
 ```
 
 ## 4. Flux vs. raster predictors
@@ -513,17 +677,16 @@ the overall trend, and points are coloured and shaped by wetland type. The panel
 title gives ρ.
 
 ```{r scatter-fn}
-scatter_panel <- function(gas, stat_sel, w = FOCAL_WINDOW) {
-  cols <- pred_info |> filter(window == w, stat == stat_sel) |> arrange(band)
-  rho_lab <- flux_cor |>
-    filter(gas == !!gas, window == w, stat == stat_sel) |>
-    transmute(col, lab = sprintf("%s  (ρ = %.2f%s)", band, rho,
-                                 ifelse(p < 0.05, "*", "")))
+## Faceted scatterplots of flux vs. a set of columns; labels name each panel
+scatter_grid <- function(gas, cols, labels, title) {
+  rho_lab <- map_dfr(cols, \(p) spearman(dat[[p]], dat[[gas]])) |>
+    mutate(col = cols,
+           lab = sprintf("%s  (ρ = %.2f%s)", labels, rho, ifelse(p < 0.05, "*", "")))
   long <- dat |>
-    select(Site_ID, Wetland_Type, y = all_of(gas), all_of(cols$col)) |>
-    pivot_longer(all_of(cols$col), names_to = "col", values_to = "x") |>
+    select(Site_ID, Wetland_Type, y = all_of(gas), all_of(cols)) |>
+    pivot_longer(all_of(cols), names_to = "col", values_to = "x") |>
     left_join(rho_lab, by = "col") |>
-    mutate(lab = factor(lab, levels = rho_lab$lab[match(cols$col, rho_lab$col)]))
+    mutate(lab = factor(lab, levels = rho_lab$lab))
 
   p <- ggplot(long, aes(x, y)) +
     geom_smooth(method = "loess", formula = y ~ x, span = 1, se = FALSE,
@@ -532,12 +695,17 @@ scatter_panel <- function(gas, stat_sel, w = FOCAL_WINDOW) {
     facet_wrap(~lab, scales = "free_x", ncol = 4) +
     scale_color_manual(values = WT_COLS) +
     scale_shape_manual(values = WT_SHAPES) +
-    labs(title = sprintf("%s vs window %s predictors, %d m window", gas, stat_sel, w),
-         subtitle = "* unadjusted p < 0.05",
+    labs(title = title, subtitle = "* unadjusted p < 0.05",
          x = NULL, y = paste("Site-mean", gas, "flux"),
          color = "Wetland type", shape = "Wetland type")
   if (gas == "CH4") p <- p + scale_y_ch4()
   p
+}
+
+scatter_panel <- function(gas, stat_sel, w = FOCAL_WINDOW) {
+  cols <- pred_info |> filter(window == w, stat == stat_sel) |> arrange(band)
+  scatter_grid(gas, cols$col, as.character(cols$band),
+               sprintf("%s vs window %s predictors, %d m window", gas, stat_sel, w))
 }
 ```
 
@@ -639,11 +807,119 @@ ggplot(within_cor, aes(rho, feature, color = Wetland_Type, shape = Wetland_Type)
        x = "ρ", y = NULL, color = "Subset", shape = "Subset")
 ```
 
-## 5. Notes for the modeling notebook
+## 5. Flux vs. climate predictors
+
+### 5.1 Spearman correlations
+
+BH adjustment is applied within the 14 climate tests for each gas.
+
+```{r clim-flux-cor, fig.height=5}
+clim_flux_cor <- clim_info |>
+  crossing(gas = c("CH4", "CO2")) |>
+  mutate(res = map2(col, gas, \(p, g) spearman(dat[[p]], dat[[g]]))) |>
+  unnest(res) |>
+  group_by(gas) |>
+  mutate(p_BH = p.adjust(p, method = "BH")) |>
+  ungroup()
+
+ggplot(clim_flux_cor, aes(rho, label)) +
+  geom_vline(xintercept = 0, color = "#c3c2b7") +
+  geom_vline(xintercept = c(-0.285, 0.285), color = "#c3c2b7", linetype = "dashed") +
+  geom_segment(aes(x = 0, xend = rho, yend = label), color = "#898781", linewidth = 0.5) +
+  geom_point(size = 2.6, color = "#2a78d6") +
+  facet_wrap(~gas) +
+  scale_y_discrete(limits = rev) +
+  scale_x_continuous(limits = c(-1, 1)) +
+  labs(title = "Spearman ρ between site-mean flux and climate predictors",
+       subtitle = "Dashed lines are approximate unadjusted p = 0.05 for n = 48",
+       x = "ρ", y = NULL)
+
+clim_flux_cor |>
+  select(gas, source, variable = label, rho, p, p_BH) |>
+  arrange(gas, desc(abs(rho))) |>
+  kable(digits = 3, caption = "Flux vs. climate predictors")
+```
+
+### 5.2 Scatterplots
+
+::: {.panel-tabset}
+
+#### CH4
+
+```{r sc-ch4-clim, fig.height=8}
+scatter_grid("CH4", clim_info$col, as.character(clim_info$label),
+             "CH4 vs climate predictors")
+```
+
+#### CO2
+
+```{r sc-co2-clim, fig.height=8}
+scatter_grid("CO2", clim_info$col, as.character(clim_info$label),
+             "CO2 vs climate predictors")
+```
+
+:::
+
+### 5.3 Consistency across sampling rounds
+
+The ERA5, anomaly and sample-month variables describe the conditions at each
+visit, so here each round's flux is paired with that round's own climate values.
+The annual normals are the same for both rounds.
+
+```{r clim-round-rho, fig.height=5}
+clim_flux_round <- flux_round |>
+  left_join(clim_round, by = c("Site_ID", "Round_Number"))
+
+clim_round_cor <- crossing(clim_info, gas = c("CH4", "CO2"), round = 1:2) |>
+  mutate(res = pmap(list(col, gas, round), function(p, g, r) {
+    d <- filter(clim_flux_round, Round_Number == r)
+    spearman(d[[p]], d[[paste0(g, "_avg")]])
+  })) |>
+  unnest(res) |>
+  mutate(round = as.character(round)) |>
+  bind_rows(mutate(clim_flux_cor, round = "Site mean")) |>
+  mutate(round = factor(round, levels = c("1", "2", "Site mean"),
+                        labels = c("Round 1", "Round 2", "Site mean")))
+
+ggplot(clim_round_cor, aes(rho, label, color = round, shape = round)) +
+  geom_vline(xintercept = 0, color = "#c3c2b7") +
+  geom_point(size = 2.4, alpha = 0.9) +
+  facet_wrap(~gas) +
+  scale_color_manual(values = c("Round 1" = "#2a78d6", "Round 2" = "#eb6834",
+                                "Site mean" = "#1baf7a")) +
+  scale_shape_manual(values = c(16, 17, 15)) +
+  scale_y_discrete(limits = rev) +
+  scale_x_continuous(limits = c(-1, 1)) +
+  labs(title = "Spearman ρ with climate by sampling round",
+       x = "ρ", y = NULL, color = NULL, shape = NULL)
+```
+
+### 5.4 Raster and climate predictors ranked together
+
+```{r combined-rank}
+bind_rows(
+  flux_cor |> filter(window == FOCAL_WINDOW) |>
+    transmute(gas, type = "raster", predictor = as.character(feature), rho, p),
+  clim_flux_cor |>
+    transmute(gas, type = "climate", predictor = as.character(label), rho, p)
+) |>
+  group_by(gas) |>
+  slice_max(abs(rho), n = 10) |>
+  ungroup() |>
+  kable(digits = 3, caption = sprintf(
+    "Top 10 predictors per gas: raster (%d m window) and climate", FOCAL_WINDOW))
+```
+
+## 6. Notes for the modeling notebook
 
 * **Window choice.** Use Section 3.1 together with Section 4.2. Where windows are
   redundant, pick the one with the strongest and most consistent flux signal. A
   single common window keeps the prediction map pipeline simple.
+* **Climate.** The PRISM normals are static and could be mapped at prediction
+  time. The ERA5 and anomaly variables describe the weather around each visit,
+  so a statewide map needs a reference period (for example, a typical July).
+  Section 3.6 shows which climate variables overlap with DEM or other raster
+  predictors.
 * **Predictor shortlist.** Take at most one predictor per cluster (Section 3.4).
   Section 3.5 shows how many can coexist with VIF < `r VIF_FLAG`. With n = 48,
   roughly 3–5 terms is a realistic ceiling for a regression model.
