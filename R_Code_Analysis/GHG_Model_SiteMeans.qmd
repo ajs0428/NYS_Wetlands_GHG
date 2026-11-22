@@ -1,0 +1,587 @@
+---
+title: "GHG flux models: site means"
+subtitle: "CH4 and CO2 vs. raster and climate predictors"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    embed-resources: true
+    fig-width: 9
+    fig-height: 5
+execute:
+  warning: false
+  message: false
+---
+
+## Purpose and setup
+
+Iteration 2. The models are kept deliberately simple:
+
+* **Response:** site-mean flux (mean of the two sampling rounds), n = 48.
+* **Predictors:** DEM SD, WETprob mean, NDVI mean, CHM mean (raster, `r 10` m
+  window) and PRISM annual precipitation. All are standardized (mean 0, SD 1),
+  so coefficients are the change in the response per 1 SD of the predictor.
+* **CH4 response:** log(CH4 + c), chosen in iteration 1 (Section 2).
+* **No random effect:** the ecoregion random intercept is tested in Section 3
+  and dropped. Models are ordinary `lm()` fits, which use the same formula
+  syntax as lme4 without the `(1 | group)` term.
+* **No wetland type:** the production maps have no wetland classes, so type
+  can't be used for upscaling.
+* **Interactions:** a priori WETprob × NDVI, plus an exploratory screen
+  (Section 4).
+* **Checks:** residual diagnostics, then spatial autocorrelation in the
+  residuals (Section 6).
+
+Exploratory results behind these choices are in `GHG_Raster_EDA.qmd`.
+
+```{r setup}
+library(sf)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(patchwork)
+library(knitr)
+library(here)
+library(lme4)
+library(lmerTest) # p-values for lmer fixed effects (Satterthwaite)
+
+## --- Settings ---------------------------------------------------------------
+RASTER_CSV <- here("Data/GHG/NYDEC_GHG_Site_RasterPredictors.csv")
+CLIMATE_CSV <- here("Data/GHG/NYDEC_GHG_Site_Climate.csv")
+SITES_GPKG <- here("Data/GHG/NYDEC_GHG_all_site_data_GPSupd_6347.gpkg")
+
+WINDOW <- 10 # raster window (m)
+
+## Predictor columns (before standardizing) -> short names used in models
+PREDICTORS <- c(
+  DEM_sd       = sprintf("DEM_sd_%dm", WINDOW),
+  WETprob_mean = sprintf("WETprob_mean_%dm", WINDOW),
+  NDVI_mean    = sprintf("NDVI_mean_%dm", WINDOW),
+  CHM_mean     = sprintf("CHM_mean_%dm", WINDOW),
+  ppt_annual   = "prism_ppt_annual"
+)
+
+ASINH_SCALE <- 0.01 # asinh(CH4 / s): linear below ~s, log-like above
+SHIFT_ADD <- 0.01 # log / Gamma shift: CH4 + |min(CH4)| + SHIFT_ADD
+
+set.seed(1)
+
+## --- Plot styling (same palette as the EDA notebook) ------------------------
+WT_COLS <- c(EM = "#2a78d6", FO = "#eb6834", SS = "#1baf7a")
+WT_SHAPES <- c(EM = 16, FO = 17, SS = 15)
+theme_set(
+  theme_minimal(base_size = 11) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(color = "#e1e0d9", linewidth = 0.3),
+          strip.text = element_text(face = "bold", hjust = 0),
+          plot.title.position = "plot",
+          legend.position = "top")
+)
+```
+
+## 1. Data
+
+```{r load}
+flux_site <- st_read(SITES_GPKG, quiet = TRUE) |>
+  st_drop_geometry() |>
+  group_by(Site_ID) |>
+  summarise(CH4 = mean(CH4_avg), CO2 = mean(CO2_avg), .groups = "drop")
+
+## PRISM annual normals are the same for both rounds; take the site mean anyway
+clim_site <- read.csv(CLIMATE_CSV) |>
+  group_by(Site_ID) |>
+  summarise(prism_ppt_annual = mean(prism_ppt_annual), .groups = "drop")
+
+dat <- read.csv(RASTER_CSV, colClasses = c(huc12 = "character")) |>
+  select(Site_ID, Ecoregion, Wetland_Type, x, y, all_of(unname(PREDICTORS[PREDICTORS != "prism_ppt_annual"]))) |>
+  left_join(flux_site, by = "Site_ID") |>
+  left_join(clim_site, by = "Site_ID") |>
+  rename(all_of(PREDICTORS)) |>
+  mutate(
+    Ecoregion = factor(Ecoregion),
+    Wetland_Type = factor(Wetland_Type, levels = names(WT_COLS)),
+    ## standardized copies used in the models: z_<name>
+    across(all_of(names(PREDICTORS)), \(v) as.numeric(scale(v)), .names = "z_{.col}")
+  )
+
+stopifnot(nrow(dat) == 48, !anyNA(dat))
+z_preds <- paste0("z_", names(PREDICTORS))
+```
+
+### Predictor collinearity
+
+```{r pred-check}
+pred_cor <- cor(dat[names(PREDICTORS)], method = "spearman")
+kable(pred_cor, digits = 2, caption = "Spearman ρ among the predictors")
+
+## VIF = diagonal of the inverse correlation matrix
+vif <- diag(solve(cor(dat[z_preds])))
+kable(tibble(predictor = names(PREDICTORS), VIF = vif), digits = 2,
+      caption = "Variance inflation factors (all < 5 is fine)")
+```
+
+## 2. CH4 response transformations
+
+CH4 is strongly right-skewed and has a few small negative values, so a plain
+log is not possible. Candidates:
+
+| Name | Transform | Notes |
+|---|---|---|
+| raw | CH4 | reference |
+| log shift | log(CH4 + c) | c = \|min\| + `r SHIFT_ADD`; results depend somewhat on c |
+| asinh | asinh(CH4 / `r ASINH_SCALE`) | no shift needed; linear near 0, log-like above `r ASINH_SCALE` |
+| Gamma | CH4 + c, Gamma GLMM with log link | models the mean on the log scale; no back-transform bias |
+
+```{r transforms}
+ch4_shift <- abs(min(dat$CH4)) + SHIFT_ADD
+
+dat <- dat |>
+  mutate(
+    CH4_shift = CH4 + ch4_shift,
+    CH4_log = log(CH4_shift),
+    CH4_asinh = asinh(CH4 / ASINH_SCALE)
+  )
+
+cat(sprintf("Shift c = %.4f; %d of 48 site means are negative\n",
+            ch4_shift, sum(dat$CH4 < 0)))
+```
+
+```{r transform-plots, fig.height=6}
+tr_long <- dat |>
+  select(Site_ID, raw = CH4, `log shift` = CH4_log, asinh = CH4_asinh) |>
+  pivot_longer(-Site_ID, names_to = "transform") |>
+  mutate(transform = factor(transform, levels = c("raw", "log shift", "asinh")))
+
+h <- ggplot(tr_long, aes(value)) +
+  geom_histogram(bins = 15, fill = "#2a78d6", color = "white") +
+  facet_wrap(~transform, scales = "free") +
+  labs(title = "Site-mean CH4 under each transformation", x = NULL, y = "Sites")
+
+q <- ggplot(tr_long, aes(sample = value)) +
+  stat_qq_line(color = "#c3c2b7") +
+  stat_qq(size = 1.6, color = "#2a78d6") +
+  facet_wrap(~transform, scales = "free") +
+  labs(title = "Normal Q-Q plots", x = "Theoretical", y = "Sample")
+
+h / q
+```
+
+```{r transform-table}
+tr_long |>
+  group_by(transform) |>
+  summarise(
+    skewness = mean((value - mean(value))^3) / sd(value)^3,
+    shapiro_W = shapiro.test(value)$statistic,
+    shapiro_p = shapiro.test(value)$p.value,
+    .groups = "drop"
+  ) |>
+  kable(digits = 3, caption = "Shape of the CH4 response")
+```
+
+
+**Decision (iteration 2):** CH4 is modeled as log(CH4 + c). In iteration 1 it
+gave the most normal response and residuals. asinh was similar but slightly
+skewed, and a Gamma GLMM on the shifted flux fit poorly (one site 5 SD out).
+
+## 3. Random effect check: is `(1 | Ecoregion)` needed?
+
+Sites were sampled 12 per ecoregion, so ecoregion is the natural grouping. A
+random intercept is needed if sites in the same ecoregion have more similar
+flux than the predictors explain. The check below fits each model with and
+without the random intercept, both by maximum likelihood so their AICs are
+comparable. It also reports the ecoregion share of the residual variance.
+
+```{r re-check}
+f_ch4 <- as.formula(paste("CH4_log ~", paste(z_preds, collapse = " + ")))
+f_co2 <- as.formula(paste("CO2 ~", paste(z_preds, collapse = " + ")))
+
+re_check <- function(f, label) {
+  m_lm <- lm(f, data = dat)
+  m_re <- lmer(update(f, . ~ . + (1 | Ecoregion)), data = dat, REML = FALSE)
+  vc <- as.data.frame(VarCorr(m_re))
+  lrt <- anova(m_re, m_lm)
+  tibble(
+    response = label,
+    ecoregion_var = vc$vcov[vc$grp == "Ecoregion"],
+    residual_var = vc$vcov[vc$grp == "Residual"],
+    ecoregion_share = ecoregion_var / (ecoregion_var + residual_var),
+    AIC_lm = AIC(m_lm),
+    AIC_lmer = AIC(m_re),
+    LRT_p = lrt$`Pr(>Chisq)`[2]
+  )
+}
+
+bind_rows(re_check(f_ch4, "CH4 (log shift)"), re_check(f_co2, "CO2")) |>
+  kable(digits = 3, caption = "Ecoregion random intercept: ML fits with and without")
+```
+
+The LRT p-value is conservative, because the variance is tested at its
+boundary of zero. Halving it is the usual correction.
+
+**Decision:** drop the random effect and fit `lm()` with the same formula.
+The basis is the result above, not an assumption that sites within an
+ecoregion are independent. Residual similarity at shorter distances (within an
+ecoregion) is checked in Section 6. Ecoregion is also a mappable layer, so it
+could return later as a fixed effect if residuals show regional structure.
+
+## 4. CH4 model (log shift, `lm`)
+
+### 4.1 Base model
+
+```{r ch4-base}
+ch4_base <- lm(f_ch4, data = dat)
+summary(ch4_base)
+```
+
+```{r coef-fn}
+## Coefficient estimates with 95% CIs, one row per term per model
+coef_table <- function(models) {
+  imap_dfr(models, function(m, nm) {
+    ci <- confint(m)
+    tibble(model = nm, term = names(coef(m)), estimate = unname(coef(m)),
+           lo = ci[, 1], hi = ci[, 2])
+  }) |>
+    filter(term != "(Intercept)") |>
+    mutate(term = gsub("z_", "", term),
+           term = factor(term, levels = rev(unique(term))),
+           model = factor(model, levels = names(models)))
+}
+
+plot_coefs <- function(ct, title, xlab = "Estimate per 1 SD") {
+  ggplot(ct, aes(estimate, term)) +
+    geom_vline(xintercept = 0, color = "#c3c2b7") +
+    geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0, color = "#898781") +
+    geom_point(size = 2.6, color = "#2a78d6") +
+    facet_wrap(~model) +
+    labs(title = title, subtitle = "95% confidence intervals", x = xlab, y = NULL)
+}
+```
+
+### 4.2 Interaction: WETprob × NDVI (a priori hypothesis)
+
+**Hypothesis:** wetter sites with lower vegetation productivity have higher
+CH4. In the model this is `WETprob_mean * NDVI_mean`. The hypothesis predicts
+a **negative** interaction coefficient: as WETprob rises, the NDVI slope
+becomes more negative, so low-NDVI sites stand out most where it is wet.
+
+Two caveats for reading the result:
+
+* At 10 m in summer, low NDVI in a wetland often means open water or bare,
+  saturated ground, not only low productivity. NDVI and NDWI are close to mirror
+  images here (EDA: ρ ≈ −0.87). So "low NDVI" may partly be a second wetness
+  signal.
+* WETprob mean is bunched near 1 (see the quantiles below). That leaves little
+  spread for an interaction to act on.
+
+```{r wetprob-range}
+quantile(dat$WETprob_mean, c(0, 0.1, 0.25, 0.5, 0.75, 0.9, 1)) |> round(3)
+```
+
+```{r ch4-int}
+ch4_int <- lm(update(f_ch4, . ~ . + z_WETprob_mean:z_NDVI_mean), data = dat)
+summary(ch4_int)
+
+anova(ch4_base, ch4_int)
+c(AIC_base = AIC(ch4_base), AIC_interaction = AIC(ch4_int))
+```
+
+```{r int-plot-fn}
+## Predicted CH4 vs `x` at low / median / high `mod` (10th, 50th, 90th
+## percentiles); other predictors held at their mean (z = 0). Predictions are
+## back-transformed to flux: exp(fit) - c (the median, not the mean, flux).
+plot_interaction <- function(m, x, mod, title) {
+  zx <- paste0("z_", x)
+  zm <- paste0("z_", mod)
+  q <- quantile(dat[[zm]], c(0.1, 0.5, 0.9))
+  grid <- crossing(!!zx := seq(min(dat[[zx]]), max(dat[[zx]]), length.out = 50),
+                   !!zm := q)
+  for (p in setdiff(z_preds, c(zx, zm))) grid[[p]] <- 0
+  pr <- predict(m, newdata = grid, interval = "confidence")
+  grid <- grid |>
+    mutate(fit = exp(pr[, "fit"]) - ch4_shift,
+           lo = exp(pr[, "lwr"]) - ch4_shift,
+           hi = exp(pr[, "upr"]) - ch4_shift,
+           xval = .data[[zx]] * sd(dat[[x]]) + mean(dat[[x]]),
+           level = factor(.data[[zm]], levels = q,
+                          labels = sprintf("%s %s (%.2f)", c("Low", "Median", "High"), mod,
+                                           q * sd(dat[[mod]]) + mean(dat[[mod]]))))
+  ggplot(grid, aes(xval, fit)) +
+    geom_point(data = dat, aes(x = .data[[x]], y = CH4), color = "#c3c2b7", size = 1.8,
+               inherit.aes = FALSE) +
+    geom_ribbon(aes(ymin = lo, ymax = hi, fill = level), alpha = 0.15) +
+    geom_line(aes(color = level, linetype = level), linewidth = 0.9) +
+    scale_color_manual(values = c("#2a78d6", "#898781", "#eb6834")) +
+    scale_fill_manual(values = c("#2a78d6", "#898781", "#eb6834")) +
+    scale_y_continuous(trans = scales::pseudo_log_trans(sigma = 0.01),
+                       breaks = c(0, 0.01, 0.1, 1, 10)) +
+    labs(title = title,
+         subtitle = "Other predictors at their mean; grey points = observed site means",
+         x = x, y = "CH4 flux (pseudo-log axis)",
+         color = NULL, fill = NULL, linetype = NULL)
+}
+```
+
+```{r int-plot, fig.height=5}
+plot_interaction(ch4_int, "NDVI_mean", "WETprob_mean",
+                 "Predicted CH4 vs NDVI at low, median and high WETprob")
+```
+
+### 4.3 Other candidate interactions (exploratory)
+
+These interactions also have an ecological rationale. Each is added to the base
+model **one at a time**:
+
+| Interaction | Rationale |
+|---|---|
+| WETprob × DEM_sd | Wet, flat ground is saturated evenly; on wet ground with hummocks and hollows, CH4 depends on microtopography |
+| WETprob × CHM_mean | Separates open wet sites (marsh, fen) from wet forested sites (swamp); open, wet sites are expected to emit more |
+| WETprob × ppt_annual | A wet landscape in a wetter climate stays saturated longer |
+| DEM_sd × ppt_annual | Microtopography matters more where water supply is limited |
+| NDVI × CHM_mean | Productive herbaceous cover (high NDVI, low canopy) vs forest |
+
+With n = 48 and five main effects, the model can only support one or two
+interactions. Taking the best of several also overstates its evidence: with
+six candidates, one p ≈ 0.05 is close to what chance alone produces.
+**Treat this table as hypothesis-generating.** Any interaction carried forward
+should be checked with cross-validation, not only its p-value.
+
+```{r int-screen}
+candidates <- c(
+  "WETprob × NDVI"       = "z_WETprob_mean:z_NDVI_mean",
+  "WETprob × DEM_sd"     = "z_WETprob_mean:z_DEM_sd",
+  "WETprob × CHM_mean"   = "z_WETprob_mean:z_CHM_mean",
+  "WETprob × ppt_annual" = "z_WETprob_mean:z_ppt_annual",
+  "DEM_sd × ppt_annual"  = "z_DEM_sd:z_ppt_annual",
+  "NDVI × CHM_mean"      = "z_NDVI_mean:z_CHM_mean"
+)
+
+int_models <- map(candidates, \(trm) lm(update(f_ch4, as.formula(paste(". ~ . +", trm))), data = dat))
+
+imap_dfr(int_models, function(m, nm) {
+  cf <- summary(m)$coefficients
+  row <- cf[grepl(":", rownames(cf)), , drop = FALSE]
+  tibble(interaction = nm, estimate = row[1, 1], p = row[1, 4],
+         dAIC = AIC(m) - AIC(ch4_base),
+         R2 = summary(m)$r.squared, adj_R2 = summary(m)$adj.r.squared)
+}) |>
+  add_row(interaction = "(base, no interaction)", estimate = NA, p = NA, dAIC = 0,
+          R2 = summary(ch4_base)$r.squared, adj_R2 = summary(ch4_base)$adj.r.squared,
+          .before = 1) |>
+  kable(digits = 3, caption = "CH4 base model plus one interaction (dAIC < 0 = better than base)")
+```
+
+::: {.panel-tabset}
+
+#### WETprob × DEM_sd
+
+```{r int-dem, fig.height=5}
+plot_interaction(int_models[["WETprob × DEM_sd"]], "DEM_sd", "WETprob_mean",
+                 "Predicted CH4 vs DEM SD at low, median and high WETprob")
+```
+
+#### WETprob × CHM_mean
+
+```{r int-chm, fig.height=5}
+plot_interaction(int_models[["WETprob × CHM_mean"]], "CHM_mean", "WETprob_mean",
+                 "Predicted CH4 vs CHM mean at low, median and high WETprob")
+```
+
+:::
+
+### 4.4 Coefficients and diagnostics
+
+```{r ch4-models}
+ch4_models <- list(
+  base = ch4_base,
+  `+ WETprob × NDVI` = ch4_int
+)
+```
+
+```{r ch4-coefs, fig.height=4.5}
+plot_coefs(coef_table(ch4_models), "CH4 (log shift): coefficients",
+           "Estimate per 1 SD (log scale; exp(b) = multiplicative change)")
+```
+
+```{r diag-fn}
+## Residuals vs fitted and normal Q-Q, models side by side
+diag_plots <- function(models) {
+  d <- imap_dfr(models, \(m, nm) tibble(
+    model = nm, fitted = fitted(m), resid = residuals(m),
+    Wetland_Type = dat$Wetland_Type
+  )) |>
+    mutate(model = factor(model, levels = names(models)))
+  rf <- ggplot(d, aes(fitted, resid)) +
+    geom_hline(yintercept = 0, color = "#c3c2b7") +
+    geom_point(aes(color = Wetland_Type, shape = Wetland_Type), size = 2) +
+    facet_wrap(~model, scales = "free") +
+    scale_color_manual(values = WT_COLS) +
+    scale_shape_manual(values = WT_SHAPES) +
+    labs(title = "Residuals vs fitted", x = "Fitted", y = "Residual",
+         color = "Wetland type", shape = "Wetland type")
+  qq <- ggplot(d, aes(sample = resid)) +
+    stat_qq_line(color = "#c3c2b7") +
+    stat_qq(size = 1.6, color = "#2a78d6") +
+    facet_wrap(~model, scales = "free") +
+    labs(title = "Residual normal Q-Q", x = "Theoretical", y = "Sample")
+  rf / qq
+}
+```
+
+```{r ch4-diag, fig.height=7}
+diag_plots(ch4_models)
+```
+
+Wetland type is not in the model, because it can't be mapped. Colouring the
+residuals by type shows whether the predictors already capture the differences
+between types.
+
+## 5. CO2 model
+
+CO2 is roughly symmetric and includes many negative values (uptake), so it is
+modeled untransformed with the same predictors.
+
+```{r co2-fit}
+co2_models <- list(base = lm(f_co2, data = dat))
+summary(co2_models$base)
+```
+
+```{r co2-coefs, fig.height=3.5}
+plot_coefs(coef_table(co2_models), "CO2: coefficients")
+```
+
+```{r co2-diag, fig.height=6}
+diag_plots(co2_models)
+```
+
+## 6. Spatial autocorrelation in residuals
+
+Sites cluster in space (the nearest neighbour is a median of ~14 km away, and a
+few pairs are under 1 km apart). If nearby sites have similar residuals, the
+model's standard errors are too small. Two checks:
+
+* **Moran's I.** I near 0 means no spatial pattern; positive I means nearby
+  residuals are alike. The p-value comes from 999 random permutations of the
+  residuals among sites (one-sided, testing for positive autocorrelation). Two
+  weightings are shown:
+    * **Neighbours within `r 25` km** (main test): every site pair closer than
+      25 km counts equally.
+    * **Inverse distance**: weights are 1/distance, so the handful of site
+      pairs under 1 km dominate. This can give a very different answer from
+      the band test.
+* **Correlogram:** Moran's I for site pairs within distance bands, to see at
+  what distance any similarity fades.
+
+```{r moran-fn}
+dist_km <- as.matrix(dist(dat[c("x", "y")])) / 1000
+
+moran_I <- function(r, w) {
+  z <- r - mean(r)
+  length(r) / sum(w) * sum(w * outer(z, z)) / sum(z^2)
+}
+
+moran_test <- function(r, w, nsim = 999) {
+  obs <- moran_I(r, w)
+  sims <- replicate(nsim, moran_I(sample(r), w))
+  tibble(I = obs, expected = -1 / (length(r) - 1),
+         p = (sum(sims >= obs) + 1) / (nsim + 1)) # one-sided: positive autocorrelation
+}
+
+NEIGHBOUR_KM <- 25
+
+w_band <- (dist_km <= NEIGHBOUR_KM) * 1
+diag(w_band) <- 0
+w_inv <- 1 / dist_km
+diag(w_inv) <- 0
+
+BANDS_KM <- c(0, 10, 25, 50, 100, 200, Inf)
+
+correlogram <- function(r) {
+  map_dfr(seq_len(length(BANDS_KM) - 1), function(i) {
+    w <- (dist_km > BANDS_KM[i] & dist_km <= BANDS_KM[i + 1]) * 1
+    diag(w) <- 0
+    tibble(band = sprintf("%g–%g km", BANDS_KM[i], BANDS_KM[i + 1]),
+           n_pairs = sum(w) / 2) |>
+      bind_cols(moran_test(r, w))
+  }) |>
+    mutate(band = factor(band, levels = band))
+}
+
+cat(sum(w_band) / 2, "site pairs within", NEIGHBOUR_KM, "km;",
+    sum(rowSums(w_band) > 0), "of 48 sites have at least one neighbour\n")
+
+all_models <- c(setNames(ch4_models, paste("CH4", names(ch4_models))),
+                setNames(co2_models, paste("CO2", names(co2_models))))
+model_resid <- map(all_models, residuals)
+```
+
+```{r moran-table}
+bind_rows(
+  map_dfr(model_resid, \(r) moran_test(r, w_band), .id = "model") |>
+    mutate(weights = sprintf("within %d km", NEIGHBOUR_KM)),
+  map_dfr(model_resid, \(r) moran_test(r, w_inv), .id = "model") |>
+    mutate(weights = "inverse distance")
+) |>
+  select(model, weights, I, expected, p) |>
+  arrange(model) |>
+  kable(digits = 3, caption = "Moran's I of model residuals")
+```
+
+```{r correlogram, fig.height=4}
+corr_res <- map_dfr(model_resid, correlogram, .id = "model") |>
+  mutate(model = factor(model, levels = names(model_resid)))
+
+ggplot(corr_res, aes(band, I, group = model)) +
+  geom_hline(yintercept = -1 / 47, color = "#c3c2b7") +
+  geom_line(color = "#898781") +
+  geom_point(aes(size = n_pairs, shape = p < 0.05), color = "#2a78d6") +
+  facet_wrap(~model, nrow = 1) +
+  scale_size_area(max_size = 4, name = "Site pairs") +
+  scale_shape_manual(values = c(`FALSE` = 1, `TRUE` = 16), name = "p < 0.05") +
+  labs(title = "Residual correlogram", subtitle = "Grey line = expected I with no autocorrelation",
+       x = "Distance band", y = "Moran's I") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+corr_res |>
+  filter(BANDS_KM[as.integer(band)] < 50) |>
+  select(model, band, n_pairs, I, p) |>
+  kable(digits = 3, caption = "Correlogram, bands under 50 km")
+```
+
+Bands with few site pairs (small points) are noisy; focus on the short bands.
+
+```{r resid-map, fig.height=6}
+imap_dfr(model_resid, \(r, nm) tibble(model = nm, x = dat$x, y = dat$y,
+                                      resid_z = as.numeric(scale(r)))) |>
+  mutate(model = factor(model, levels = names(model_resid))) |>
+  ggplot(aes(x / 1000, y / 1000, fill = resid_z)) +
+  geom_point(shape = 21, size = 3, color = "white", stroke = 0.4) +
+  facet_wrap(~model) +
+  scale_fill_gradient2(low = "#2a78d6", mid = "#f0efec", high = "#e34948",
+                       midpoint = 0, limits = c(-2.5, 2.5), oob = scales::squish,
+                       name = "Residual (SD)") +
+  coord_equal() +
+  labs(title = "Residuals in space", subtitle = "Colour capped at ±2.5 SD",
+       x = "Easting (km, EPSG:6347)", y = "Northing (km)") +
+  theme(legend.position = "right")
+```
+
+## 7. Next steps
+
+* **Spatial autocorrelation in CH4 residuals.** If the 0–25 km signal holds, the
+  options from least to most complex are:
+    * a random intercept for a spatial group defined at that scale, for example
+      sites clustered within ~25 km (`(1 | site_group)` in lme4);
+    * a spatial correlation structure (`nlme::gls` with `corExp`); or
+    * spatially blocked cross-validation, so predictive skill is not overstated.
+* **Interactions.** Decide whether any interaction from Section 4.3 is worth
+  carrying forward, and test it with cross-validation.
+* **Predictive check.** Use leave-one-out or spatially blocked cross-validation
+  to see how well the models predict sites they were not fitted on.
+
+```{r session}
+sessionInfo()
+```
