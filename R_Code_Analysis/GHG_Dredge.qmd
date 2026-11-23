@@ -1,0 +1,1032 @@
+---
+title: "GHG flux models: all-subsets selection with dredge"
+subtitle: "CH4 and CO2 site means, with checks against selection on noise"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    embed-resources: true
+    fig-width: 9
+    fig-height: 5
+execute:
+  warning: false
+  message: false
+---
+
+## Purpose
+
+`GHG_Model_SiteMeans.qmd` uses a hand-picked set of five predictors. This
+notebook lets the data choose instead. `MuMIn::dredge()` fits every model
+built from a pool of candidate predictors, up to a maximum size, and ranks
+them by an information criterion.
+
+With n = 48 sites and ~20 candidate predictors there are over a thousand
+candidate models, so the best one will look good even if no predictor
+matters. The default settings use four safeguards against this:
+
+1. **A screened candidate pool.** Predictors are dropped one at a time until
+   every VIF is below a threshold, and strongly correlated pairs may not share
+   a model.
+2. **Small models.** At most `M_MAX` terms per model.
+3. **A permutation test of the whole search.** The response is shuffled and
+   dredge is run again many times. That gives the AIC gain of the best model
+   over the null that you get when the predictors carry no information. The
+   real gain is compared against it.
+4. **Nested cross-validation.** Dredge is re-run without each held-out fold,
+   and the model it picks predicts that fold. This measures how well the
+   *selection procedure* predicts new sites, not just the model it chose.
+
+**Reading the output.** p-values and confidence intervals for the selected
+model are too optimistic, because the same data chose the model. Use the
+permutation test and the cross-validation to decide whether there is a
+signal. Use summed weights and the top-model set to decide which predictors
+carry it.
+
+## Settings
+
+All settings that change the analysis are in this chunk. Edit them and
+re-render.
+
+```{r settings}
+## ============================================================================
+## Candidate predictor pool
+## ============================================================================
+WINDOW <- 10 # raster window (m): 10, 30 or 50
+
+## Raster bands and statistics; each band x stat becomes "<band>_<stat>"
+RASTER_BANDS <- c("DEM", "twi", "HAND", "CHM", "TPI", "DMV",
+                  "NDVI", "NDWI", "NDVI_lo", "NDWI_lo", "WETprob")
+RASTER_STATS <- c("mean", "sd")
+
+## Climate columns from NYDEC_GHG_Site_Climate.csv (averaged over the two
+## sampling rounds). Short names used in the models: "temperature_2m" ->
+## "tmean", "total_precipitation_sum" -> "ppt".
+CLIMATE_VARS <- c(
+  "prism_ppt_annual",
+  "prism_tmean_annual",
+  "era5_temperature_2m_14d",
+  "era5_total_precipitation_sum_14d"
+)
+
+## Hand adjustments to the pool (use the short names, e.g. "DEM_sd")
+EXCLUDE <- character() # never in the pool
+PROTECT <- character() # always in the pool; the VIF screen won't drop these
+FIXED <- character()   # in every model (dredge `fixed =`); also protected
+
+## Interactions to offer dredge, e.g. c("WETprob_mean:NDVI_mean").
+## Dredge only fits an interaction alongside both of its main effects, and
+## both main effects are protected from the VIF screen. An interaction uses 3
+## of the M_MAX terms, so raise M_MAX to 4 to let it sit with another predictor.
+INTERACTIONS <- character(3)
+
+## ============================================================================
+## Pool screening
+## ============================================================================
+VIF_MAX <- 10   # drop highest-VIF predictor until all are below this; Inf = off
+COR_MAX <- 0.7 # pairs with |Spearman rho| >= this can't share a model; 1 = off
+
+## ============================================================================
+## Dredge
+## ============================================================================
+M_MIN <- 0       # min terms per model (0 = include the null model)
+M_MAX <- 5       # max terms per model (counts fixed terms and interactions)
+MAX_MAIN <- NA   # max main effects per model, interactions not counted; NA = off.
+                 # Use with INTERACTIONS, e.g. MAX_MAIN = 3 and M_MAX = 7 for a
+                 # full 3-way. Much slower (~2 min per dredge with ~22
+                 # predictors), so raise N_CORES or lower N_PERM.
+RANK <- "AICc"   # "AICc", "AIC" or "BIC"
+DELTA_TOP <- 2   # "top set" = models within this many units of the best
+
+## ============================================================================
+## Responses
+## ============================================================================
+CH4_TRANSFORM <- "log_shift" # "log_shift" = log(CH4 + c); "asinh" = asinh(CH4 / s)
+SHIFT_ADD <- 0.02            # c = |min(CH4)| + SHIFT_ADD
+ASINH_SCALE <- 0.02          # s
+
+## ============================================================================
+## Checks against selection on noise
+## ============================================================================
+N_PERM <- 100       # permutations of the response (0 = skip)
+CV_SCHEME <- "loo"  # "loo" (leave one site out), "spatial" (leave out a group
+                    # of sites within CV_BLOCK_KM of each other), "ecoregion"
+                    # (leave out one ecoregion), or "none"
+CV_BLOCK_KM <- 25   # spatial group size for CV_SCHEME = "spatial"
+CV_PREDICT <- "best" # "best" = top model of each fold; "average" = model
+                     # average of that fold's top set (delta < DELTA_TOP)
+
+N_CORES <- min(8, parallel::detectCores()) # parallel workers for perm and CV; 1 = serial
+SEED <- 1
+
+## ============================================================================
+## Candidate formulas (Section 6): hand-picked models, checked one by one
+## ============================================================================
+## Named list of formulas. Response: CH4_resp (CH4 under CH4_TRANSFORM) or
+## CO2. Predictors: any short name loaded in Section 1, not just the
+## screened pool; all are standardized. list() skips Section 6.
+CANDIDATES <- list(
+  `CH4 3-way` = CH4_resp ~ DMV_sd * WETprob_mean * era5_tmean_14d
+)
+## A candidate found by screening looks better than it is. The permutation
+## test in Section 6.3 shuffles the response and repeats a screen like yours:
+## the best full-interaction model (a * b * ...) of any CAND_SEARCH_K
+## predictors from CAND_SEARCH_POOL. Match these to how you actually screened.
+CAND_SEARCH_K <- 3          # predictors per screened model; 0 = skip the test
+CAND_SEARCH_POOL <- "pool"  # "pool" = screened pool (Section 2); "all" = all
+CAND_N_PERM <- 200
+```
+
+```{r setup}
+library(sf)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(patchwork)
+library(knitr)
+library(here)
+library(MuMIn)
+library(parallel)
+
+options(na.action = "na.fail") # dredge requires this
+
+RASTER_CSV <- here("Data/GHG/NYDEC_GHG_Site_RasterPredictors.csv")
+CLIMATE_CSV <- here("Data/GHG/NYDEC_GHG_Site_Climate.csv")
+SITES_GPKG <- here("Data/GHG/NYDEC_GHG_all_site_data_GPSupd_6347.gpkg")
+
+RNGkind("L'Ecuyer-CMRG") # reproducible random streams across parallel workers
+set.seed(SEED)
+
+INTERACTIONS <- INTERACTIONS[nzchar(INTERACTIONS)] # tolerate e.g. character(3)
+
+stopifnot(
+  CAND_SEARCH_POOL %in% c("pool", "all"),
+  CH4_TRANSFORM %in% c("log_shift", "asinh"),
+  CV_SCHEME %in% c("loo", "spatial", "ecoregion", "none"),
+  CV_PREDICT %in% c("best", "average"),
+  RANK %in% c("AICc", "AIC", "BIC")
+)
+
+## --- Plot styling (same palette as the other GHG notebooks) -----------------
+WT_COLS <- c(EM = "#2a78d6", FO = "#eb6834", SS = "#1baf7a")
+WT_SHAPES <- c(EM = 16, FO = 17, SS = 15)
+RESP_COLS <- c(CH4 = "#2a78d6", CO2 = "#eb6834")
+theme_set(
+  theme_minimal(base_size = 11) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(color = "#e1e0d9", linewidth = 0.3),
+          strip.text = element_text(face = "bold", hjust = 0),
+          plot.title.position = "plot",
+          legend.position = "top")
+)
+```
+
+## 1. Data
+
+```{r load}
+short_clim <- function(x) {
+  x |> sub("total_precipitation_sum", "ppt", x = _) |>
+    sub("temperature_2m", "tmean", x = _)
+}
+
+raster_cols <- c(outer(RASTER_BANDS, RASTER_STATS, \(b, s) sprintf("%s_%s_%dm", b, s, WINDOW)))
+raster_short <- sub(sprintf("_%dm$", WINDOW), "", raster_cols)
+clim_short <- short_clim(CLIMATE_VARS)
+
+flux_site <- st_read(SITES_GPKG, quiet = TRUE) |>
+  st_drop_geometry() |>
+  group_by(Site_ID) |>
+  summarise(CH4 = mean(CH4_avg), CO2 = mean(CO2_avg), .groups = "drop")
+
+clim_site <- read.csv(CLIMATE_CSV) |>
+  group_by(Site_ID) |>
+  summarise(across(all_of(CLIMATE_VARS), mean), .groups = "drop") |>
+  rename_with(short_clim, -Site_ID)
+
+dat <- read.csv(RASTER_CSV, colClasses = c(huc12 = "character")) |>
+  select(Site_ID, Ecoregion, Wetland_Type, x, y, all_of(raster_cols)) |>
+  rename_with(\(v) sub(sprintf("_%dm$", WINDOW), "", v)) |>
+  left_join(flux_site, by = "Site_ID") |>
+  left_join(clim_site, by = "Site_ID") |>
+  mutate(Ecoregion = factor(Ecoregion),
+         Wetland_Type = factor(Wetland_Type, levels = names(WT_COLS)))
+
+stopifnot(nrow(dat) == 48, !anyNA(dat))
+
+## Response transforms
+ch4_shift <- abs(min(dat$CH4)) + SHIFT_ADD
+dat$CH4_resp <- switch(CH4_TRANSFORM,
+  log_shift = log(dat$CH4 + ch4_shift),
+  asinh = asinh(dat$CH4 / ASINH_SCALE)
+)
+RESPONSES <- c(CH4 = "CH4_resp", CO2 = "CO2")
+RESP_LABELS <- c(CH4 = sprintf("CH4 (%s)", sub("_", " ", CH4_TRANSFORM)), CO2 = "CO2")
+
+all_preds <- setdiff(c(raster_short, clim_short), EXCLUDE)
+stopifnot(all(c(PROTECT, FIXED) %in% all_preds))
+```
+
+## 2. Candidate pool
+
+### 2.1 VIF screen
+
+Predictors are standardized (mean 0, SD 1), so coefficients are per 1 SD.
+Standardizing doesn't change any model's fit or predictions. It also doesn't
+leak information between CV folds, because a linear model's predictions don't
+change under a linear rescaling of its predictors.
+
+```{r vif}
+int_mains <- unique(unlist(strsplit(INTERACTIONS, ":", fixed = TRUE)))
+stopifnot(all(int_mains %in% all_preds))
+protected <- unique(c(PROTECT, FIXED, int_mains))
+
+vif_of <- function(X) {
+  v <- tryCatch(diag(solve(cor(X))), error = function(e) rep(Inf, ncol(X)))
+  setNames(v, colnames(X))
+}
+
+## Drop exact linear combinations, then the highest-VIF unprotected predictor
+## until every VIF is below `thresh`
+vif_stepdown <- function(X, thresh, protected) {
+  log <- tibble(step = integer(), dropped = character(), vif = numeric())
+  q <- qr(scale(X), tol = 1e-7)
+  if (q$rank < ncol(X)) {
+    aliased <- setdiff(colnames(X)[q$pivot[-seq_len(q$rank)]], protected)
+    log <- add_row(log, step = seq_along(aliased), dropped = aliased, vif = Inf)
+    X <- X[, setdiff(colnames(X), aliased), drop = FALSE]
+  }
+  repeat {
+    v <- vif_of(X)
+    cand <- v[setdiff(names(v), protected)]
+    if (!is.finite(thresh) || length(cand) == 0 || max(v) < thresh || ncol(X) <= 2) break
+    worst <- names(which.max(cand))
+    log <- add_row(log, step = nrow(log) + 1L, dropped = worst, vif = max(cand))
+    X <- X[, setdiff(colnames(X), worst), drop = FALSE]
+  }
+  list(dropped = log, vif = v)
+}
+
+vs <- vif_stepdown(as.matrix(dat[all_preds]), VIF_MAX, protected)
+POOL <- names(vs$vif)
+
+## Standardized copies of the pool, overwriting the raw columns in `mdat`
+mdat <- dat |> mutate(across(all_of(POOL), \(v) as.numeric(scale(v))))
+
+if (nrow(vs$dropped)) {
+  kable(vs$dropped, digits = 2, caption = sprintf("Dropped by the VIF screen (VIF_MAX = %s)", VIF_MAX))
+}
+tibble(predictor = POOL, VIF = vs$vif, protected = POOL %in% protected) |>
+  arrange(desc(VIF)) |>
+  kable(digits = 2, caption = sprintf("Candidate pool: %d predictors", length(POOL)))
+```
+
+### 2.2 Correlated pairs kept apart
+
+```{r cor-pairs}
+rho <- cor(mdat[POOL], method = "spearman")
+idx <- which(abs(rho) >= COR_MAX & upper.tri(rho), arr.ind = TRUE)
+cor_pairs <- tibble(a = rownames(rho)[idx[, 1]], b = colnames(rho)[idx[, 2]],
+                    rho = rho[idx]) |>
+  arrange(desc(abs(rho)))
+
+## dredge subset matrix: FALSE = these two terms may not share a model.
+## MuMIn reads only the lower triangle.
+subset_mat <- abs(rho) < COR_MAX
+subset_mat[!lower.tri(subset_mat)] <- NA
+
+if (nrow(cor_pairs)) {
+  kable(cor_pairs, digits = 2,
+        caption = sprintf("Pairs with |ρ| ≥ %.2f: never in the same model", COR_MAX))
+} else {
+  cat(sprintf("No pairs with |rho| >= %.2f.\n", COR_MAX))
+}
+```
+
+## 3. Dredge
+
+```{r dredge-fns}
+## Global model for one response
+global_formula <- function(resp) {
+  reformulate(c(POOL, INTERACTIONS), response = resp)
+}
+
+## Which term combinations dredge may fit. Without MAX_MAIN, a logical matrix
+## keeps correlated pairs apart (fast). With MAX_MAIN, one expression does
+## both: at most MAX_MAIN main effects, and no correlated pair.
+dredge_subset <- if (!is.na(MAX_MAIN)) {
+  mains <- setdiff(POOL, FIXED)
+  str2lang(paste(c(
+    sprintf("(%s) <= %d", paste0("`", mains, "`", collapse = " + "), MAX_MAIN),
+    sprintf("!(`%s` & `%s`)", cor_pairs$a, cor_pairs$b)
+  ), collapse = " & "))
+} else if (nrow(cor_pairs)) {
+  subset_mat
+}
+
+## Dredge one response on one data set. The formula and data are inlined
+## into the lm() call, so dredge and get.models() can re-fit any sub-model
+## from any environment (in a CV fold, in a forked worker, or later chunks).
+run_dredge <- function(resp, d) {
+  g <- eval(bquote(lm(.(global_formula(resp)), data = .(d))))
+  ## bquote so the rank column is named after RANK ("AICc"), not "RANK"
+  suppressMessages(eval(bquote(
+    dredge(g, rank = .(RANK), m.lim = c(M_MIN, M_MAX),
+           fixed = .(if (length(FIXED)) FIXED else NULL),
+           subset = .(dredge_subset))
+  )))
+}
+
+## Parallel map for the permutation tests and CV.
+## * Forking (mclapply) is fastest, but some IDEs forbid it (Positron:
+##   "Can't fork the R session"). CAN_FORK tests this once.
+## * Otherwise a socket (PSOCK) cluster of fresh R sessions is used. Those
+##   sessions start empty, so each call names the global objects FUN needs
+##   in `export`; packages and options are set up when the cluster starts.
+## * N_CORES = 1 runs serially.
+CAN_FORK <- .Platform$OS.type == "unix" && tryCatch({
+  mccollect(mcparallel(TRUE))
+  TRUE
+}, error = function(e) FALSE)
+
+par_cl <- NULL # socket cluster, started on first use
+
+## Globals used by run_dredge() and the helpers below
+DREDGE_EXPORTS <- c("mdat", "run_dredge", "global_formula", "dredge_subset",
+                    "POOL", "INTERACTIONS", "FIXED", "RANK", "M_MIN", "M_MAX",
+                    "terms_in", "cand_terms", "null_gain")
+
+par_map <- function(X, FUN, export = character()) {
+  if (N_CORES <= 1) return(lapply(X, FUN))
+  if (CAN_FORK) {
+    out <- mclapply(X, FUN, mc.cores = N_CORES, mc.set.seed = TRUE)
+    ## mclapply returns worker errors as "try-error" objects; stop on the first
+    err <- keep(out, \(o) inherits(o, "try-error"))
+    if (length(err)) stop("worker failed: ", err[[1]])
+    return(out)
+  }
+  if (is.null(par_cl)) {
+    par_cl <<- makeCluster(N_CORES)
+    clusterEvalQ(par_cl, {
+      suppressPackageStartupMessages({
+        library(dplyr)
+        library(purrr)
+        library(MuMIn)
+      })
+      options(na.action = "na.fail")
+    })
+    clusterSetRNGStream(par_cl, SEED)
+  }
+  clusterExport(par_cl, export, envir = globalenv())
+  parLapply(par_cl, X, FUN)
+}
+
+cat(if (N_CORES <= 1) "Serial" else if (CAN_FORK) "Forked" else "Socket-cluster",
+    "parallel backend,", N_CORES, "cores\n")
+
+## Terms that dredge can switch on and off (the fixed ones are always in)
+## Labels are taken from the fitted global model, because R may reorder an
+## interaction's variables ("a:b" can become "b:a").
+cand_terms <- setdiff(attr(terms(global_formula("CO2")), "term.labels"), FIXED)
+
+## Terms in each row of a model.selection table
+terms_in <- function(dd) {
+  cols <- intersect(cand_terms, names(dd))
+  apply(!is.na(as.data.frame(dd)[cols]), 1, \(r) cols[r], simplify = FALSE)
+}
+
+## Rank-criterion gain of the best model over the null (fixed terms only)
+null_gain <- function(dd) {
+  k <- lengths(terms_in(dd))
+  if (!any(k == 0)) return(NA_real_)
+  dd$delta[k == 0][1]
+}
+
+## "a + b", with fixed terms first in brackets: "[fixed] + a + b"
+model_label <- function(tt) {
+  fx <- if (length(FIXED)) sprintf("[%s]", paste(FIXED, collapse = " + ")) else character()
+  map_chr(tt, \(t) {
+    parts <- c(fx, t)
+    if (length(parts)) paste(parts, collapse = " + ") else "(null)"
+  })
+}
+```
+
+```{r dredge-run}
+dd_list <- map(RESPONSES, \(r) run_dredge(r, mdat))
+
+tibble(response = RESP_LABELS[names(dd_list)],
+       models_fitted = map_int(dd_list, nrow),
+       top_set = map_int(dd_list, \(dd) sum(dd$delta < DELTA_TOP)),
+       best_model = map_chr(dd_list, \(dd) model_label(terms_in(dd)[1])),
+       best_weight = map_dbl(dd_list, \(dd) dd$weight[1]),
+       null_rank = map_int(dd_list, \(dd) which(lengths(terms_in(dd)) == 0)[1]),
+       null_delta = map_dbl(dd_list, null_gain)) |>
+  kable(digits = 3, caption = sprintf("Dredge summary (%s, at most %d terms)", RANK, M_MAX))
+```
+
+### 3.1 Top model sets
+
+Models within `r DELTA_TOP` `r RANK` units of the best. A long top set with
+no clear winner means the data don't separate the candidate predictors.
+
+```{r top-sets, results = "asis"}
+for (nm in names(dd_list)) {
+  dd <- dd_list[[nm]]
+  top <- dd[dd$delta < DELTA_TOP, ]
+  tibble(model = model_label(terms_in(top)), df = top$df,
+         R2 = map_dbl(get.models(top, subset = TRUE), \(m) summary(m)$r.squared),
+         !!RANK := top[[RANK]], delta = top$delta, weight = top$weight) |>
+    kable(digits = 3, caption = sprintf("%s: top set (delta < %g)", RESP_LABELS[nm], DELTA_TOP)) |>
+    print()
+  cat("\n\n")
+}
+```
+
+### 3.2 Predictor importance (summed weights)
+
+Each predictor's summed Akaike weight over **all** models that contain it.
+Because the pool, the correlated-pair rule and `M_MAX` restrict which models
+exist, these sums are relative to that model set, not absolute
+probabilities. As a reference, the dashed line shows a predictor's expected
+sum if every model had equal weight. It is drawn for each response, as the
+model set can differ with `FIXED`.
+
+```{r importance, fig.height=6}
+imp <- imap_dfr(dd_list, function(dd, nm) {
+  tt <- terms_in(dd)
+  tibble(response = nm, term = cand_terms,
+         sw = map_dbl(cand_terms, \(t) sum(dd$weight[map_lgl(tt, \(x) t %in% x)])),
+         equal_w = map_dbl(cand_terms, \(t) mean(map_lgl(tt, \(x) t %in% x))))
+})
+
+imp_order <- imp |> group_by(term) |> summarise(m = max(sw)) |> arrange(m) |> pull(term)
+
+ggplot(imp, aes(sw, factor(term, levels = imp_order))) +
+  geom_col(aes(fill = response), width = 0.7, show.legend = FALSE) +
+  geom_point(aes(x = equal_w), shape = 124, size = 4, color = "#3a3936") +
+  facet_wrap(~response, labeller = labeller(response = RESP_LABELS)) +
+  scale_fill_manual(values = RESP_COLS) +
+  scale_x_continuous(limits = c(0, 1), expand = expansion(mult = c(0, 0.02))) +
+  labs(title = "Summed model weight per predictor",
+       subtitle = "Tick = expected sum if all models were equally supported",
+       x = "Summed weight", y = NULL)
+```
+
+### 3.3 Coefficients: top model and model average
+
+The model average is taken over the top set and uses the *full* average:
+terms absent from a model count as 0, which shrinks weakly supported terms
+toward 0. Intervals are shown for reference only. They do not account for
+the selection step, so they are too narrow.
+
+```{r coefs, fig.height=6}
+coef_df <- imap_dfr(dd_list, function(dd, nm) {
+  best <- get.models(dd, 1)[[1]]
+  ci <- confint(best)
+  out <- tibble(response = nm, model = "top model", term = names(coef(best)),
+                estimate = unname(coef(best)), lo = ci[, 1], hi = ci[, 2])
+  if (sum(dd$delta < DELTA_TOP) > 1) {
+    av <- model.avg(dd, subset = delta < DELTA_TOP)
+    cf <- coef(av, full = TRUE)
+    ci <- confint(av, full = TRUE)
+    out <- bind_rows(out, tibble(response = nm, model = "top-set average", term = names(cf),
+                                 estimate = unname(cf), lo = ci[names(cf), 1], hi = ci[names(cf), 2]))
+  }
+  out
+}) |>
+  filter(term != "(Intercept)")
+
+ggplot(coef_df, aes(estimate, term, color = model)) +
+  geom_vline(xintercept = 0, color = "#c3c2b7") +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0,
+                 position = position_dodge(width = 0.5)) +
+  geom_point(size = 2.4, position = position_dodge(width = 0.5)) +
+  facet_wrap(~response, scales = "free_x", labeller = labeller(response = RESP_LABELS)) +
+  scale_color_manual(values = c(`top model` = "#2a78d6", `top-set average` = "#898781")) +
+  labs(title = "Coefficients per 1 SD of each predictor",
+       subtitle = "95% intervals, not adjusted for model selection",
+       x = "Estimate", y = NULL, color = NULL)
+```
+
+### 3.4 Top-model diagnostics
+
+```{r diag, fig.height=6}
+diag_d <- imap_dfr(dd_list, function(dd, nm) {
+  m <- get.models(dd, 1)[[1]]
+  tibble(response = nm, fitted = fitted(m), resid = residuals(m),
+         Wetland_Type = mdat$Wetland_Type)
+})
+
+rf <- ggplot(diag_d, aes(fitted, resid)) +
+  geom_hline(yintercept = 0, color = "#c3c2b7") +
+  geom_point(aes(color = Wetland_Type, shape = Wetland_Type), size = 2) +
+  facet_wrap(~response, scales = "free", labeller = labeller(response = RESP_LABELS)) +
+  scale_color_manual(values = WT_COLS) +
+  scale_shape_manual(values = WT_SHAPES) +
+  labs(title = "Top model: residuals vs fitted", x = "Fitted", y = "Residual",
+       color = "Wetland type", shape = "Wetland type")
+
+qq <- ggplot(diag_d, aes(sample = resid)) +
+  stat_qq_line(color = "#c3c2b7") +
+  stat_qq(size = 1.6, color = "#2a78d6") +
+  facet_wrap(~response, scales = "free", labeller = labeller(response = RESP_LABELS)) +
+  labs(title = "Residual normal Q-Q", x = "Theoretical", y = "Sample")
+
+rf / qq
+```
+
+## 4. Is the selected model better than chance?
+
+### 4.1 Permutation test
+
+Shuffling the response breaks any link to the predictors but keeps its
+distribution and the predictors' correlations. Dredge is then re-run with the
+same settings. The statistic is the null model's delta: how many `r RANK`
+units the best model beats the null by. The p-value is the share of shuffles
+whose best model beats the null by at least as much as the real data's.
+
+```{r perm}
+perm_res <- if (N_PERM > 0) {
+  imap(RESPONSES, function(r, nm) {
+    obs <- null_gain(dd_list[[nm]])
+    perm <- unlist(par_map(seq_len(N_PERM), function(i) {
+      d <- mdat
+      d[[r]] <- sample(d[[r]])
+      null_gain(run_dredge(r, d))
+    }, export = DREDGE_EXPORTS))
+    list(obs = obs, perm = perm, p = (sum(perm >= obs) + 1) / (N_PERM + 1))
+  })
+}
+```
+
+```{r perm-plot, fig.height=4}
+if (N_PERM > 0) {
+  perm_long <- imap_dfr(perm_res, \(p, nm) tibble(response = nm, gain = p$perm))
+  perm_obs <- imap_dfr(perm_res, \(p, nm) tibble(
+    response = nm, gain = p$obs,
+    lab = sprintf("observed = %.1f\np = %.3f", p$obs, p$p)))
+
+  print(
+    ggplot(perm_long, aes(gain)) +
+      geom_histogram(aes(fill = response), bins = 25, color = "white", show.legend = FALSE) +
+      geom_vline(data = perm_obs, aes(xintercept = gain), color = "#3a3936", linewidth = 0.8) +
+      geom_text(data = perm_obs, aes(x = gain, y = Inf, label = lab),
+                hjust = -0.08, vjust = 1.3, size = 3.3, color = "#3a3936") +
+      facet_wrap(~response, scales = "free", labeller = labeller(response = RESP_LABELS)) +
+      scale_fill_manual(values = RESP_COLS) +
+      labs(title = sprintf("Best-model gain over the null: real data vs %d shuffles", N_PERM),
+           x = sprintf("Null model delta %s", RANK), y = "Shuffles")
+  )
+}
+```
+
+### 4.2 Nested cross-validation
+
+In each fold, everything in Section 3 is re-run on the training sites only.
+The model it selects then predicts the held-out sites. The baseline
+prediction is the training-fold mean. **Predictive R² ≤ 0 means the selected
+models predict new sites no better than that mean.** For CH4 the errors are on
+the transformed scale.
+
+Folds: `r CV_SCHEME`. With `"spatial"`, sites are grouped by complete-linkage
+clustering so that every pair in a group is within `r CV_BLOCK_KM` km. That
+keeps nearby, similar sites out of the training data for each other.
+
+```{r cv-folds}
+cv_folds <- switch(CV_SCHEME,
+  loo = seq_len(nrow(mdat)),
+  spatial = cutree(hclust(dist(mdat[c("x", "y")]) / 1000, method = "complete"), h = CV_BLOCK_KM),
+  ecoregion = as.integer(mdat$Ecoregion),
+  none = NULL
+)
+if (!is.null(cv_folds)) {
+  cat(sprintf("%d folds; held-out sites per fold: min %d, median %g, max %d\n",
+              n_distinct(cv_folds), min(table(cv_folds)), median(table(cv_folds)),
+              max(table(cv_folds))))
+}
+```
+
+```{r cv}
+predict_fold <- function(dd, newdata) {
+  if (CV_PREDICT == "average" && sum(dd$delta < DELTA_TOP) > 1) {
+    predict(model.avg(get.models(dd, subset = delta < DELTA_TOP)), newdata = newdata, full = TRUE)
+  } else {
+    predict(get.models(dd, 1)[[1]], newdata = newdata)
+  }
+}
+
+cv_res <- if (!is.null(cv_folds)) {
+  imap(RESPONSES, function(r, nm) {
+    folds <- par_map(sort(unique(cv_folds)), function(k) {
+      test <- cv_folds == k
+      dd <- run_dredge(r, mdat[!test, ])
+      list(pred = tibble(row = which(test), pred = unname(predict_fold(dd, mdat[test, ])),
+                         base = mean(mdat[[r]][!test])),
+           terms = terms_in(dd)[[1]])
+    }, export = c(DREDGE_EXPORTS, "cv_folds", "predict_fold", "CV_PREDICT", "DELTA_TOP"))
+    pred <- map_dfr(folds, "pred") |>
+      arrange(row) |>
+      mutate(obs = mdat[[r]][row], Wetland_Type = mdat$Wetland_Type[row])
+    list(pred = pred, terms = map(folds, "terms"))
+  })
+}
+```
+
+```{r cv-table}
+if (!is.null(cv_folds)) {
+  imap_dfr(cv_res, \(cv, nm) with(cv$pred, tibble(
+    response = RESP_LABELS[nm],
+    RMSE_selected = sqrt(mean((obs - pred)^2)),
+    RMSE_mean = sqrt(mean((obs - base)^2)),
+    predictive_R2 = 1 - sum((obs - pred)^2) / sum((obs - base)^2),
+    in_sample_R2 = summary(get.models(dd_list[[nm]], 1)[[1]])$r.squared
+  ))) |>
+    kable(digits = 3, caption = sprintf("Nested CV (%s folds, %s prediction)", CV_SCHEME, CV_PREDICT))
+}
+```
+
+```{r cv-plot, fig.height=4.5}
+if (!is.null(cv_folds)) {
+  cvp <- imap_dfr(cv_res, \(cv, nm) mutate(cv$pred, response = nm))
+  ggplot(cvp, aes(obs, pred)) +
+    geom_abline(color = "#c3c2b7") +
+    geom_hline(aes(yintercept = mean(obs)), color = "#c3c2b7", linetype = "dashed") +
+    geom_point(aes(color = Wetland_Type, shape = Wetland_Type), size = 2) +
+    facet_wrap(~response, scales = "free", labeller = labeller(response = RESP_LABELS)) +
+    scale_color_manual(values = WT_COLS) +
+    scale_shape_manual(values = WT_SHAPES) +
+    labs(title = "Held-out predictions from the nested CV",
+         subtitle = "Solid = 1:1; dashed = mean of observed",
+         x = "Observed", y = "Predicted (held out)",
+         color = "Wetland type", shape = "Wetland type")
+}
+```
+
+### 4.3 Selection stability across folds
+
+How often each predictor is in the best model of a CV fold. A real effect is
+picked in most folds. A predictor picked in only a few folds was chosen
+because of particular sites.
+
+```{r stability, fig.height=5}
+if (!is.null(cv_folds)) {
+  stab <- imap_dfr(cv_res, function(cv, nm) {
+    tibble(response = nm, term = cand_terms,
+           freq = map_dbl(cand_terms, \(t) mean(map_lgl(cv$terms, \(x) t %in% x))))
+  }) |>
+    group_by(term) |> filter(max(freq) > 0) |> ungroup()
+
+  stab_order <- stab |> group_by(term) |> summarise(m = max(freq)) |> arrange(m) |> pull(term)
+
+  print(
+    ggplot(stab, aes(freq, factor(term, levels = stab_order))) +
+      geom_col(aes(fill = response), width = 0.7, show.legend = FALSE) +
+      facet_wrap(~response, labeller = labeller(response = RESP_LABELS)) +
+      scale_fill_manual(values = RESP_COLS) +
+      scale_x_continuous(limits = c(0, 1), labels = scales::percent) +
+      labs(title = "Share of CV folds whose best model includes each predictor",
+           subtitle = "Predictors never selected are omitted", x = NULL, y = NULL)
+  )
+
+  imap_dfr(cv_res, \(cv, nm) tibble(response = RESP_LABELS[nm], model = model_label(cv$terms))) |>
+    count(response, model, sort = TRUE) |>
+    group_by(response) |> slice_head(n = 5) |> ungroup() |>
+    kable(caption = "Most common best models across CV folds (top 5 per response)")
+}
+```
+
+## 5. Summary
+
+```{r summary}
+tibble(
+  response = RESP_LABELS[names(dd_list)],
+  best_model = map_chr(dd_list, \(dd) model_label(terms_in(dd)[1])),
+  in_sample_R2 = map_dbl(dd_list, \(dd) summary(get.models(dd, 1)[[1]])$r.squared),
+  gain_over_null = map_dbl(dd_list, null_gain),
+  perm_p = if (N_PERM > 0) map_dbl(perm_res, "p") else NA_real_,
+  cv_R2 = if (!is.null(cv_folds)) {
+    map_dbl(cv_res, \(cv) with(cv$pred, 1 - sum((obs - pred)^2) / sum((obs - base)^2)))
+  } else NA_real_
+) |>
+  kable(digits = 3, caption = "Does the dredge selection hold up?")
+
+cat(sprintf(paste0(
+  "Settings: window %d m; pool %d predictors (VIF < %s, |rho| < %s apart); ",
+  "%s; %d-%d terms (max %s main effects); %d interactions; %d fixed; ",
+  "%d permutations; CV %s (%s)\n"),
+  WINDOW, length(POOL), VIF_MAX, COR_MAX, RANK, M_MIN, M_MAX,
+  if (is.na(MAX_MAIN)) "-" else MAX_MAIN, length(INTERACTIONS),
+  length(FIXED), N_PERM, CV_SCHEME, CV_PREDICT))
+```
+
+A selection worth carrying forward needs a small permutation p **and** a
+positive cross-validated R². For CO2 or CH4, take a selected predictor to
+`GHG_Model_SiteMeans.qmd` only if it is also selected in most CV folds
+(Section 4.3).
+
+## 6. Candidate formulas
+
+Hand-picked models from `CANDIDATES`, for example ones found by preliminary
+screening. Each is checked as a fixed formula:
+
+* **6.1 Comparison:** fit and cross-validation against the null model, the
+  same predictors without interactions, and dredge's best model.
+* **6.2 Terms:** F-tests of the highest-order terms, and coefficients.
+* **6.3 Search-adjusted test:** how often a screen like yours finds an R² this
+  high when the response is shuffled.
+* **6.4 Influence:** sites with high leverage, and whether the top-order terms
+  survive dropping any one site.
+* **6.5 Interaction plots:** fitted surfaces, with the sites behind them.
+
+The in-sample numbers in 6.1 and 6.2 (R², AICc, F-test p) assume the formula
+was chosen before seeing the data. For a screened candidate they are too
+optimistic. The cross-validation in 6.1 is optimistic too, because the
+formula was picked using all sites; only the screen in 6.3 is repeated on
+the shuffled data. Section 6.3 is the honest test.
+
+```{r cand-setup, eval = length(CANDIDATES) > 0}
+## Every predictor standardized (not only the pool), for any candidate
+cdat <- dat |> mutate(across(all_of(all_preds), \(v) as.numeric(scale(v))))
+
+cand_resp <- function(f) all.vars(f[[2]])
+cand_vars <- function(f) all.vars(f[[3]])
+resp_name <- function(f) names(RESPONSES)[RESPONSES == cand_resp(f)]
+
+walk(CANDIDATES, function(f) {
+  stopifnot(cand_resp(f) %in% RESPONSES)
+  bad <- setdiff(cand_vars(f), names(cdat))
+  if (length(bad)) stop("unknown predictor(s): ", paste(bad, collapse = ", "))
+})
+
+## Highest-order terms of a model (e.g. the 3-way term of a * b * c)
+top_terms <- function(m) {
+  tt <- terms(m)
+  attr(tt, "term.labels")[attr(tt, "order") == max(attr(tt, "order"))]
+}
+
+## Fixed-formula CV: refit in each fold, predict held-out sites
+cand_folds <- list(
+  loo = seq_len(nrow(cdat)),
+  spatial = cutree(hclust(dist(cdat[c("x", "y")]) / 1000, method = "complete"), h = CV_BLOCK_KM),
+  ecoregion = as.integer(cdat$Ecoregion)
+)
+cv_fixed <- function(f, folds) {
+  y <- cdat[[cand_resp(f)]]
+  pred <- base <- numeric(length(y))
+  for (k in unique(folds)) {
+    test <- folds == k
+    pred[test] <- predict(lm(f, data = cdat[!test, ]), newdata = cdat[test, ])
+    base[test] <- mean(y[!test])
+  }
+  1 - sum((y - pred)^2) / sum((y - base)^2)
+}
+
+cand_fits <- map(CANDIDATES, \(f) lm(f, data = cdat))
+```
+
+### 6.1 Comparison with simpler models
+
+`k` is the number of coefficients. Cross-validated R² ≤ 0 means no better
+than predicting the training-fold mean. `spatial` holds out groups of sites
+within `r CV_BLOCK_KM` km; `ecoregion` holds out one ecoregion at a time.
+
+```{r cand-compare, results = "asis", eval = length(CANDIDATES) > 0}
+iwalk(CANDIDATES, function(f, nm) {
+  r <- cand_resp(f)
+  comp <- list(
+    `null` = reformulate("1", response = r),
+    `main effects only` = reformulate(cand_vars(f), response = r),
+    `dredge best` = formula(get.models(dd_list[[resp_name(f)]], 1)[[1]]),
+    candidate = f
+  )
+  comp <- comp[!duplicated(map_chr(comp, \(x) paste(deparse(x), collapse = "")))]
+  imap_dfr(comp, function(fc, lab) {
+    m <- lm(fc, data = cdat)
+    tibble(model = lab, formula = paste(deparse(fc[[3]], width.cutoff = 500), collapse = ""),
+           k = length(coef(m)), sites_per_coef = nrow(cdat) / k,
+           R2 = summary(m)$r.squared, adj_R2 = summary(m)$adj.r.squared, AICc = AICc(m),
+           cv_loo = cv_fixed(fc, cand_folds$loo),
+           cv_spatial = cv_fixed(fc, cand_folds$spatial),
+           cv_ecoregion = cv_fixed(fc, cand_folds$ecoregion))
+  }) |>
+    kable(digits = 3, caption = sprintf("%s (%s): comparison", nm, RESP_LABELS[resp_name(f)])) |>
+    print()
+  cat("\n\n")
+})
+```
+
+### 6.2 Terms
+
+`drop1` F-tests remove each highest-order term in turn. Lower-order terms are
+only tested once nothing above them depends on them, so these respect
+marginality.
+
+```{r cand-terms, results = "asis", eval = length(CANDIDATES) > 0}
+iwalk(cand_fits, function(m, nm) {
+  d1 <- drop1(m, test = "F")
+  tibble(term = rownames(d1)[-1], df = d1$Df[-1], F = d1$`F value`[-1], p = d1$`Pr(>F)`[-1]) |>
+    kable(digits = 3, caption = sprintf("%s: F-tests of the highest-order terms", nm)) |>
+    print()
+  cat("\n\n")
+  cf <- summary(m)$coefficients
+  tibble(term = rownames(cf), estimate = cf[, 1], SE = cf[, 2], t = cf[, 3], p = cf[, 4]) |>
+    kable(digits = 3, caption = sprintf("%s: coefficients (per 1 SD)", nm)) |>
+    print()
+  cat("\n\n")
+})
+```
+
+### 6.3 Search-adjusted permutation test
+
+The screen: fit `a * b * ...` (all interactions) for every set of
+`r CAND_SEARCH_K` predictors from the `r CAND_SEARCH_POOL` set, and keep the
+highest R². On the real data that best R² is at least the candidate's (if the
+candidate is one of the screened models). On shuffled data it shows how high
+the best R² gets by chance. **p = share of shuffles whose best screened R²
+reaches the candidate's R².** If you screened differently (other predictors,
+other model forms, or other responses too), set `CAND_SEARCH_K` and
+`CAND_SEARCH_POOL` to match. If you can't match it, treat p as a lower bound.
+
+```{r cand-perm, eval = length(CANDIDATES) > 0 && CAND_SEARCH_K > 0}
+search_vars <- if (CAND_SEARCH_POOL == "all") all_preds else POOL
+search_sets <- combn(search_vars, CAND_SEARCH_K, simplify = FALSE)
+
+## QR of each screened design matrix, computed once; for any response vector
+## the residuals are then one qr.resid() call per model
+search_qr <- map(search_sets, \(v) qr(model.matrix(
+  reformulate(paste(sprintf("`%s`", v), collapse = " * ")), cdat)))
+
+search_r2 <- function(y) {
+  tss <- sum((y - mean(y))^2)
+  map_dbl(search_qr, \(q) 1 - sum(qr.resid(q, y)^2) / tss)
+}
+
+## One permutation distribution per response used by a candidate
+cand_perm <- map(set_names(unique(map_chr(CANDIDATES, cand_resp))), function(r) {
+  y <- cdat[[r]]
+  list(obs = search_r2(y),
+       perm = unlist(par_map(seq_len(CAND_N_PERM), \(i) max(search_r2(sample(y))),
+                             export = c("search_r2", "search_qr"))))
+})
+
+imap_dfr(cand_fits, function(m, nm) {
+  cp <- cand_perm[[cand_resp(formula(m))]]
+  r2 <- summary(m)$r.squared
+  tibble(candidate = nm, models_screened = length(search_qr), candidate_R2 = r2,
+         rank_on_real_data = sum(cp$obs > r2 + 1e-12) + 1,
+         best_screened_R2 = max(cp$obs),
+         shuffled_best_median = median(cp$perm),
+         shuffled_best_95 = quantile(cp$perm, 0.95),
+         p = (sum(cp$perm >= r2) + 1) / (CAND_N_PERM + 1))
+}) |>
+  kable(digits = 3, caption = sprintf(
+    "Best of %d screened %d-predictor interaction models: real vs %d shuffles",
+    length(search_qr), CAND_SEARCH_K, CAND_N_PERM))
+```
+
+```{r cand-perm-plot, fig.height=3.5, eval = length(CANDIDATES) > 0 && CAND_SEARCH_K > 0}
+cand_r2 <- imap_dfr(cand_fits, \(m, nm) tibble(
+  candidate = nm, response = cand_resp(formula(m)), R2 = summary(m)$r.squared))
+
+imap_dfr(cand_perm, \(cp, r) tibble(response = r, best_R2 = cp$perm)) |>
+  inner_join(cand_r2, by = "response", relationship = "many-to-many") |>
+  ggplot(aes(best_R2)) +
+  geom_histogram(bins = 30, fill = "#898781", color = "white") +
+  geom_vline(aes(xintercept = R2), color = "#2a78d6", linewidth = 0.9) +
+  facet_wrap(~candidate, scales = "free_y") +
+  labs(title = "Best screened R² on shuffled responses",
+       subtitle = "Blue line = the candidate's R² on the real data",
+       x = "Best R² among screened models", y = "Shuffles")
+```
+
+### 6.4 Influence
+
+Leverage above 2k/n is flagged as high. A site with leverage near 1 has the
+fitted surface pass almost through it. The drop-one refits show whether the
+highest-order terms depend on single sites.
+
+```{r cand-influence, results = "asis", eval = length(CANDIDATES) > 0}
+cand_drop1 <- imap(cand_fits, function(m, nm) {
+  f <- formula(m)
+  k <- length(coef(m))
+  infl <- tibble(Site_ID = dat$Site_ID, Wetland_Type = dat$Wetland_Type,
+                 leverage = hatvalues(m), cooks_D = cooks.distance(m)) |>
+    bind_cols(dat[cand_vars(f)])
+  infl |>
+    arrange(desc(cooks_D)) |>
+    slice_head(n = 5) |>
+    mutate(high_leverage = leverage > 2 * k / nrow(dat)) |>
+    kable(digits = 3, caption = sprintf(
+      "%s: five most influential sites (Cook's D; raw predictor values; 2k/n = %.2f)",
+      nm, 2 * k / nrow(dat))) |>
+    print()
+  cat("\n\n")
+
+  tops <- top_terms(m)
+  drops <- map_dfr(seq_len(nrow(cdat)), function(i) {
+    cf <- summary(lm(f, data = cdat[-i, ]))$coefficients
+    tibble(dropped = dat$Site_ID[i], term = tops,
+           estimate = cf[tops, 1], p = cf[tops, 4])
+  })
+  drops |>
+    group_by(term) |>
+    summarise(p_all_sites = summary(m)$coefficients[term[1], 4],
+              p_median = median(p), p_max = max(p),
+              share_p_below_0.05 = mean(p < 0.05),
+              sign_flips = sum(sign(estimate) != sign(coef(m)[term[1]])),
+              worst_drop = dropped[which.max(p)], .groups = "drop") |>
+    kable(digits = 3, caption = sprintf("%s: highest-order terms when each site is dropped in turn", nm)) |>
+    print()
+  cat("\n\n")
+  mutate(drops, candidate = nm)
+})
+```
+
+```{r cand-drop1-plot, fig.height=4, eval = length(CANDIDATES) > 0}
+bind_rows(cand_drop1) |>
+  ggplot(aes(p, term)) +
+  geom_vline(xintercept = 0.05, color = "#e34948", linetype = "dashed") +
+  geom_jitter(height = 0.15, width = 0, size = 1.6, alpha = 0.7, color = "#2a78d6") +
+  facet_wrap(~candidate, scales = "free_y") +
+  scale_x_log10() +
+  labs(title = "Highest-order term p-values with each site dropped in turn",
+       subtitle = "One point per dropped site; dashed line = 0.05",
+       x = "p (log scale)", y = NULL)
+```
+
+### 6.5 Interaction plots
+
+For candidates with interactions among 2 or 3 predictors. Predictions vary
+the first predictor along the x axis and hold the second (colours) and third
+(panels) at their 10th, 50th and 90th percentiles. Points are the sites in
+each panel's third of the third predictor. Lines span regions with few or no
+sites, so the right-hand plot shows where the data are. Predictions are on
+the model scale (transformed CH4).
+
+```{r cand-int-plots, fig.height=5.5, eval = length(CANDIDATES) > 0}
+pct_lab <- c("10th", "50th", "90th")
+
+iwalk(cand_fits, function(m, nm) {
+  f <- formula(m)
+  v <- cand_vars(f)
+  if (max(attr(terms(m), "order")) < 2 || !length(v) %in% 2:3) return(invisible())
+  r <- cand_resp(f)
+  if (length(v) == 2) v[3] <- NA
+  to_raw <- \(z, var) z * sd(dat[[var]]) + mean(dat[[var]])
+
+  q2 <- quantile(cdat[[v[2]]], c(0.1, 0.5, 0.9))
+  q3 <- if (is.na(v[3])) 0 else quantile(cdat[[v[3]]], c(0.1, 0.5, 0.9))
+  grid <- expand_grid(x = seq(min(cdat[[v[1]]]), max(cdat[[v[1]]]), length.out = 60),
+                      i2 = 1:3, i3 = seq_along(q3)) |>
+    mutate(!!v[1] := x, !!v[2] := q2[i2])
+  if (!is.na(v[3])) grid[[v[3]]] <- q3[grid$i3]
+  pr <- predict(m, newdata = grid, interval = "confidence")
+  grid <- grid |>
+    mutate(fit = pr[, "fit"], lo = pr[, "lwr"], hi = pr[, "upr"],
+           x_raw = to_raw(x, v[1]),
+           col = factor(sprintf("%s %s (%.2f)", v[2], pct_lab[i2], to_raw(q2[i2], v[2])),
+                        levels = unique(sprintf("%s %s (%.2f)", v[2], pct_lab, to_raw(q2, v[2])))))
+
+  pts <- tibble(x_raw = dat[[v[1]]], y = cdat[[r]], v2 = dat[[v[2]]])
+  if (!is.na(v[3])) {
+    lab3 <- sprintf("%s %s (%.2f)", v[3], pct_lab, to_raw(q3, v[3]))
+    grid$panel <- factor(lab3[grid$i3], levels = lab3)
+    pts$panel <- factor(lab3[as.integer(cut(rank(cdat[[v[3]]], ties.method = "first"), 3))],
+                        levels = lab3)
+  }
+
+  p_fit <- ggplot(grid, aes(x_raw, fit)) +
+    geom_point(data = pts, aes(x_raw, y), color = "#c3c2b7", size = 1.6, inherit.aes = FALSE) +
+    geom_ribbon(aes(ymin = lo, ymax = hi, fill = col), alpha = 0.12) +
+    geom_line(aes(color = col), linewidth = 0.9) +
+    scale_color_manual(values = c("#2a78d6", "#898781", "#eb6834")) +
+    scale_fill_manual(values = c("#2a78d6", "#898781", "#eb6834")) +
+    labs(title = sprintf("%s: fitted surface", nm), x = v[1], y = r, color = NULL, fill = NULL) +
+    theme(legend.position = "bottom", legend.direction = "vertical")
+  if (!is.na(v[3])) p_fit <- p_fit + facet_wrap(~panel, nrow = 1)
+
+  p_dat <- ggplot(pts, aes(x_raw, v2)) +
+    labs(title = "Where the sites are", x = v[1], y = v[2]) +
+    theme(legend.position = "bottom")
+  p_dat <- if (is.na(v[3])) {
+    p_dat + geom_point(size = 2, color = "#2a78d6")
+  } else {
+    pts$v3 <- dat[[v[3]]]
+    p_dat %+% pts + geom_point(aes(color = v3), size = 2) +
+      scale_color_gradient(low = "#c3c2b7", high = "#2a78d6", name = v[3])
+  }
+
+  print(p_fit + p_dat + plot_layout(widths = c(3, 1)))
+})
+```
+
+```{r session}
+if (!is.null(par_cl)) {
+  stopCluster(par_cl)
+  par_cl <- NULL
+}
+sessionInfo()
+```
