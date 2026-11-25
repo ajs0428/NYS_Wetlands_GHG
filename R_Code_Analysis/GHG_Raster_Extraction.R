@@ -22,6 +22,16 @@
 ###     huc_stack.R's ortho_lo_indices(), then summarized like other bands.
 ###   * Windows that reach past the HUC raster edge are padded with NA; the
 ###     per-window `validfrac_*` column reports the share of 1 m pixels used.
+###   * Geomorphons (Geomorph_local, categorical classes 1-10) are summarized
+###     as the share of the window's valid 1 m pixels in four groups that sum
+###     to 1 (GEO_<group>_frac_<W>m), plus the majority group (GEO_mode_<W>m;
+###     ties go to the group listed first in GEO_GROUPS) and its share
+###     (GEO_modefrac_<W>m). The groups keep every class in a group the sites
+###     cover, so a map built from them never meets an unsampled level. A
+###     statewide tally (2026-11, wet cells p >= 0.5) found ~47% flat, ~27%
+###     concave, ~21% footslope and ~5% convex majority cells, against 22 /
+###     15 / 7 / 4 sites (10 m majority). On the map: per-class count via aggregate(sum of
+###     indicator) -> focal(n x n, sum) / valid count, same as the means.
 ###
 ### Raster predictors are static, so output is one row per site (Site_ID), to
 ### be joined to the per-round GHG data in GHG_Processing.R.
@@ -61,6 +71,20 @@ BANDS <- c(
   ndvi_lo = "NDVI_lo",
   ndwi_lo = "NDWI_lo",
   WET_prob = "WETprob"
+)
+
+## Geomorphon classes (rgeomorphon codes) -> groups. Hollow and depression are
+## water-receiving like valley; the sites have none of either as a majority
+## class, so they ride with valley. Order sets the GEO_mode tie-break.
+GEO_GROUPS <- list(
+  flat = 1, # flat
+  concave = c(7, 9, 10), # hollow, valley, depression
+  footslope = 8, # footslope
+  convex = 2:6 # peak, ridge, shoulder, spur, slope
+)
+stopifnot(
+  setequal(unlist(GEO_GROUPS), 1:10),
+  !anyDuplicated(unlist(GEO_GROUPS))
 )
 
 stopifnot(all(WINDOWS %% CELL == 0), all((WINDOWS / CELL) %% 2 == 1))
@@ -154,6 +178,9 @@ extract_site <- function(x, y, huc, cluster) {
   side <- (2 * k + 1) * CELL # pixels per side of the largest window
   stopifnot(nrow(stk) == side, ncol(stk) == side)
   arr <- as.array(stk) # rows x cols x bands, row 1 = north
+  # Geomorphons kept apart from `arr` so validfrac_* is unchanged by them
+  geo <- round(as.matrix(grab(lyrs$terr[["Geomorph_local"]]), wide = TRUE))
+  stopifnot(nrow(geo) == side, ncol(geo) == side)
 
   out <- list(
     block_x = x0 + (col + 0.5) * CELL,
@@ -176,6 +203,24 @@ extract_site <- function(x, y, huc, cluster) {
     out[[sprintf("validfrac_%dm", w)]] <- mean(apply(sub, c(1, 2), \(p) {
       all(is.finite(p))
     }))
+
+    g <- geo[idx, idx]
+    g <- g[is.finite(g) & g %in% 1:10]
+    fr <- vapply(
+      GEO_GROUPS,
+      \(cl) if (length(g)) mean(g %in% cl) else NA_real_,
+      0
+    )
+    for (grp in names(GEO_GROUPS)) {
+      out[[sprintf("GEO_%s_frac_%dm", grp, w)]] <- fr[[grp]]
+    }
+    out[[sprintf("GEO_mode_%dm", w)]] <-
+      if (length(g)) names(GEO_GROUPS)[which.max(fr)] else NA_character_
+    out[[sprintf("GEO_modefrac_%dm", w)]] <- if (length(g)) {
+      max(fr)
+    } else {
+      NA_real_
+    }
   }
   as_tibble(out)
 }

@@ -1,0 +1,944 @@
+---
+title: "GHG flux models: visit-level data with a site random effect"
+subtitle: "CH4 and CO2, 48 sites x 2 visits, all-subsets selection with dredge"
+date: today
+execute:
+  warning: false
+  message: false
+---
+
+## Purpose
+
+`GHG_Dredge.qmd` averages the two visits at each site (n = 48). This notebook
+keeps both visits (n = 96) and adds a random intercept for site:
+
+    flux ~ site-level predictors + visit-level weather + (1 | Site_ID)
+
+**Why the random effect.** The two visits at a site are not independent: the
+site intercept absorbs whatever makes a site high or low that the predictors
+don't explain. Without it, the 96 rows would be treated as 96 independent
+sites and every standard error would be too small. With 48 sites (levels) the
+site variance is estimable. With only 2 visits per site, random *slopes* are
+not, so the model has a random intercept only.
+
+**Weather split into a site part and a visit part.** Each visit-level weather
+variable `v` (e.g. ERA5 14-day mean temperature) enters as two predictors:
+
+* `v_site`: the mean of the two visits at the site. This is what
+  `GHG_Dredge.qmd` uses. It describes when (season, year) and where the site
+  was sampled, so it is confounded with everything else about the site.
+* `v_dev`: the visit's difference from that mean (± half the change between
+  rounds). It is exactly uncorrelated with every site-level predictor, and its
+  coefficient is the **within-site** effect: was flux higher on the warmer
+  visit at the same site? That effect is estimated from the 48 pairs alone.
+
+For upscaling to a typical summer day, set `v_dev = 0` and `v_site` to a
+reference value (Section 6).
+
+### How dredge is handled with a random effect
+
+* **Only the fixed effects are selected.** `(1 | Site_ID)` is in every model.
+  Its need is tested once, on the null model (Section 2).
+* **Fits use ML (`REML = FALSE`).** REML likelihoods of models with different
+  fixed effects are not comparable, so AICc/BIC from REML fits must not be
+  used to rank them.
+* **AICc uses n = 96.** For site-level predictors the effective sample size
+  is closer to 48, so AICc is slightly lenient toward them. `RANK = "BIC"` is
+  stricter.
+* **R²** is reported as marginal (fixed effects only) and conditional (fixed
+  plus site intercept), from `MuMIn::r.squaredGLMM()`.
+* **The permutation test keeps the pairing.** Shuffling single visits would
+  break the site structure, so whole sites are shuffled (both visits move
+  together) and the two visits within each site are swapped at random. That
+  keeps the site variance in every shuffle and removes any link to the
+  predictors.
+* **Cross-validation holds out whole sites** (both visits) and predicts them
+  from the fixed effects only (`re.form = NA`), because a new site has no
+  estimated intercept. This is the upscaling situation.
+* **Speed.** An `lmer` fit takes ~25× as long as an `lm` fit, so the defaults
+  are smaller than in `GHG_Dredge.qmd` (`M_MAX = 4`, fewer permutations). The
+  dredge chunk prints the number of models before fitting.
+
+**Reading the output.** As in `GHG_Dredge.qmd`: use the permutation test and
+cross-validation to decide whether there is a signal, and the summed weights
+and top-model set to decide which predictors carry it. Coefficient intervals
+don't account for the selection step.
+
+## Settings
+
+```{r settings}
+## ============================================================================
+## Candidate predictor pool
+## ============================================================================
+WINDOW <- 10 # raster window (m): 10, 30 or 50
+
+## Raster bands and statistics; each band x stat becomes "<band>_<stat>"
+RASTER_BANDS <- c("DEM", "twi", "HAND", "CHM", "TPI", "DMV",
+                  "NDVI", "NDWI", "NDVI_lo", "NDWI_lo", "WETprob")
+RASTER_STATS <- c("mean", "sd")
+
+## Site-level climate (same for both visits): PRISM normals
+SITE_CLIMATE_VARS <- c("prism_ppt_annual", "prism_tmean_annual")
+
+## Visit-level weather from NYDEC_GHG_Site_Climate.csv. Short names:
+## "temperature_2m" -> "tmean", "total_precipitation_sum" -> "ppt".
+## "doy" (day of year of the visit) can be added here as well.
+VISIT_VARS <- c("era5_temperature_2m_14d", "era5_total_precipitation_sum_14d")
+
+## TRUE: each visit variable enters as <v>_site + <v>_dev (see Purpose).
+## FALSE: the raw visit value, which mixes within- and between-site effects.
+WEATHER_SPLIT <- TRUE
+
+## Hand adjustments to the pool (short names, e.g. "DEM_sd", "era5_tmean_14d_dev")
+EXCLUDE <- character() # never in the pool
+PROTECT <- character() # always in the pool; the VIF screen won't drop these
+FIXED <- character()   # in every model (dredge `fixed =`); also protected
+
+## Interactions to offer dredge, e.g. c("WETprob_mean:era5_tmean_14d_dev").
+## An interaction uses 3 of the M_MAX terms.
+INTERACTIONS <- character()
+
+## ============================================================================
+## Pool screening
+## ============================================================================
+VIF_MAX <- 10  # drop highest-VIF predictor until all are below this; Inf = off
+COR_MAX <- 0.7 # pairs with |Spearman rho| >= this can't share a model; 1 = off
+
+## ============================================================================
+## Dredge
+## ============================================================================
+M_MIN <- 0       # min fixed terms per model (0 = include the null model)
+M_MAX <- 4       # max fixed terms per model (counts fixed terms and interactions)
+RANK <- "AICc"   # "AICc", "AIC" or "BIC"
+DELTA_TOP <- 2   # "top set" = models within this many units of the best
+
+## ============================================================================
+## Responses
+## ============================================================================
+CH4_TRANSFORM <- "log_shift" # "log_shift" = log(CH4 + c); "asinh" = asinh(CH4 / s)
+SHIFT_ADD <- 0.02            # c = |min(CH4)| + SHIFT_ADD (min over the 96 visits)
+ASINH_SCALE <- 0.02          # s
+
+## ============================================================================
+## Checks against selection on noise
+## ============================================================================
+N_PERM <- 50        # restricted permutations (0 = skip); each re-runs dredge
+CV_SCHEME <- "site" # "site" (leave one site out), "spatial" (leave out sites
+                    # within CV_BLOCK_KM of each other), "ecoregion", or "none"
+CV_BLOCK_KM <- 25
+CV_PREDICT <- "best" # "best" = top model of each fold; "average" = top-set average
+
+N_CORES <- min(8, parallel::detectCores()) # 1 = serial
+SEED <- 1
+
+## ============================================================================
+## Candidate formulas (Section 5): hand-picked fixed effects, checked one by one
+## ============================================================================
+## Named list of one-sided-response formulas WITHOUT the random effect; it is
+## added automatically. Response: CH4_resp or CO2. list() skips Section 5.
+CANDIDATES <- list(
+  `CH4 WETprob + tmean` = CH4_resp ~ WETprob_mean*DMV_sd*era5_tmean_14d_site
+)
+
+## ============================================================================
+## Upscaling reference (Section 6)
+## ============================================================================
+## Value of each <v>_site for the "typical summer day" prediction, in raw
+## units (e.g. c(era5_tmean_14d_site = 21)). Unlisted ones use the median of
+## the site means. <v>_dev is set to 0.
+REF_WEATHER <- c()
+```
+
+```{r setup}
+library(sf)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(patchwork)
+library(knitr)
+library(here)
+library(lme4)
+library(MuMIn)
+library(parallel)
+
+options(na.action = "na.fail") # dredge requires this
+
+RASTER_CSV <- here("Data/GHG/NYDEC_GHG_Site_RasterPredictors.csv")
+CLIMATE_CSV <- here("Data/GHG/NYDEC_GHG_Site_Climate.csv")
+SITES_GPKG <- here("Data/GHG/NYDEC_GHG_all_site_data_GPSupd_6347.gpkg")
+
+## Skipping the gradient check at convergence speeds up lmer ~30%. The fits
+## are simple (one variance component), so convergence problems are rare.
+LMER_CTRL <- lmerControl(calc.derivs = FALSE)
+
+## nobars() moved from lme4 to reformulas; use whichever is installed
+nobars <- if (requireNamespace("reformulas", quietly = TRUE)) reformulas::nobars else lme4::nobars
+
+## SD of the site random intercept (0 for a singular fit)
+sd_site <- function(m) as.data.frame(VarCorr(m))$sdcor[1]
+
+RNGkind("L'Ecuyer-CMRG") # reproducible random streams across parallel workers
+set.seed(SEED)
+
+stopifnot(
+  CH4_TRANSFORM %in% c("log_shift", "asinh"),
+  CV_SCHEME %in% c("site", "spatial", "ecoregion", "none"),
+  CV_PREDICT %in% c("best", "average"),
+  RANK %in% c("AICc", "AIC", "BIC")
+)
+
+## --- Plot styling (same palette as the other GHG notebooks) -----------------
+WT_COLS <- c(EM = "#2a78d6", FO = "#eb6834", SS = "#1baf7a")
+WT_SHAPES <- c(EM = 16, FO = 17, SS = 15)
+RESP_COLS <- c(CH4 = "#2a78d6", CO2 = "#eb6834")
+LEVEL_COLS <- c(site = "#898781", visit = "#1baf7a")
+theme_set(
+  theme_minimal(base_size = 11) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(color = "#e1e0d9", linewidth = 0.3),
+          strip.text = element_text(face = "bold", hjust = 0),
+          plot.title.position = "plot",
+          legend.position = "top")
+)
+```
+
+## 1. Data
+
+One row per visit. Site-level predictors repeat across a site's two visits.
+
+```{r load}
+short_clim <- function(x) {
+  x |> sub("total_precipitation_sum", "ppt", x = _) |>
+    sub("temperature_2m", "tmean", x = _)
+}
+
+raster_cols <- c(outer(RASTER_BANDS, RASTER_STATS, \(b, s) sprintf("%s_%s_%dm", b, s, WINDOW)))
+raster_short <- sub(sprintf("_%dm$", WINDOW), "", raster_cols)
+
+flux <- st_read(SITES_GPKG, quiet = TRUE) |>
+  st_drop_geometry() |>
+  select(Site_ID, Site_ID_round, Round_Number, CH4 = CH4_avg, CO2 = CO2_avg)
+
+clim <- read.csv(CLIMATE_CSV) |>
+  mutate(doy = as.integer(format(as.Date(Date), "%j"))) |>
+  select(Site_ID_round, Date, all_of(SITE_CLIMATE_VARS), all_of(VISIT_VARS)) |>
+  rename_with(short_clim, -c(Site_ID_round, Date))
+visit_short <- short_clim(VISIT_VARS)
+
+dat <- flux |>
+  left_join(clim, by = "Site_ID_round") |>
+  left_join(read.csv(RASTER_CSV, colClasses = c(huc12 = "character")) |>
+              select(Site_ID, Ecoregion, Wetland_Type, x, y, all_of(raster_cols)) |>
+              rename_with(\(v) sub(sprintf("_%dm$", WINDOW), "", v)),
+            by = "Site_ID") |>
+  arrange(Site_ID, Round_Number) |>
+  mutate(Site_ID = factor(Site_ID),
+         Ecoregion = factor(Ecoregion),
+         Wetland_Type = factor(Wetland_Type, levels = names(WT_COLS)))
+
+## Within-site split of the visit-level weather
+if (WEATHER_SPLIT) {
+  for (v in visit_short) {
+    dat[[paste0(v, "_site")]] <- ave(dat[[v]], dat$Site_ID)
+    dat[[paste0(v, "_dev")]] <- dat[[v]] - dat[[paste0(v, "_site")]]
+  }
+  visit_preds <- c(paste0(visit_short, "_site"), paste0(visit_short, "_dev"))
+} else {
+  visit_preds <- visit_short
+}
+
+## Two visits per site, rounds 1 and 2 in adjacent rows (the restricted
+## permutation in Section 4.1 relies on this order)
+stopifnot(nrow(dat) == 96, nlevels(dat$Site_ID) == 48,
+          all(dat$Round_Number == rep(1:2, 48)),
+          all(dat$Site_ID[c(TRUE, FALSE)] == dat$Site_ID[c(FALSE, TRUE)]),
+          !anyNA(dat))
+
+## Response transforms
+ch4_shift <- abs(min(dat$CH4)) + SHIFT_ADD
+dat$CH4_resp <- switch(CH4_TRANSFORM,
+  log_shift = log(dat$CH4 + ch4_shift),
+  asinh = asinh(dat$CH4 / ASINH_SCALE)
+)
+RESPONSES <- c(CH4 = "CH4_resp", CO2 = "CO2")
+RESP_LABELS <- c(CH4 = sprintf("CH4 (%s)", sub("_", " ", CH4_TRANSFORM)), CO2 = "CO2")
+
+all_preds <- setdiff(c(raster_short, SITE_CLIMATE_VARS, visit_preds), EXCLUDE)
+stopifnot(all(c(PROTECT, FIXED) %in% all_preds))
+pred_level <- function(p) ifelse(grepl("_dev$", p) | p %in% visit_short, "visit", "site")
+```
+
+How much the weather changes between a site's visits, compared with the
+spread between sites:
+
+```{r weather-split}
+if (WEATHER_SPLIT) {
+  map_dfr(visit_short, \(v) tibble(
+    variable = v,
+    sd_between_sites = sd(dat[[paste0(v, "_site")]][c(TRUE, FALSE)]),
+    sd_within_site = sd(dat[[paste0(v, "_dev")]]),
+    round2_minus_round1_mean = mean(diff(matrix(dat[[v]], nrow = 2))),
+    round2_minus_round1_range = paste(round(range(diff(matrix(dat[[v]], nrow = 2))), 2),
+                                      collapse = " to ")
+  )) |>
+    kable(digits = 2, caption = "Visit-level weather: between-site vs within-site variation")
+}
+```
+
+## 2. Is `(1 | Site_ID)` needed?
+
+The null model with and without the site intercept. The ICC is the share of
+the variance between sites. The likelihood-ratio test of a variance is on the
+boundary (it can't be below 0), so the p-value is halved.
+
+```{r ranef-check}
+imap_dfr(RESPONSES, function(r, nm) {
+  m_re <- lmer(reformulate("(1 | Site_ID)", response = r), data = dat, REML = FALSE)
+  m_lm <- lm(reformulate("1", response = r), data = dat)
+  vc <- as.data.frame(VarCorr(m_re))$vcov
+  lrt <- as.numeric(2 * (logLik(m_re) - logLik(m_lm)))
+  tibble(response = RESP_LABELS[nm], sd_site = sqrt(vc[1]), sd_visit = sqrt(vc[2]),
+         ICC = vc[1] / sum(vc), AIC_lm = AIC(m_lm), AIC_lmer = AIC(m_re),
+         LRT = lrt, p = 0.5 * pchisq(lrt, df = 1, lower.tail = FALSE))
+}) |>
+  kable(digits = 3, caption = "Null model: site random intercept vs none")
+```
+
+## 3. Candidate pool and dredge
+
+### 3.1 VIF screen and correlated pairs
+
+Predictors are standardized over the 96 rows. `_dev` predictors are exactly
+uncorrelated with all site-level predictors, so they pass the screen and are
+never kept apart from them.
+
+```{r vif}
+int_mains <- unique(unlist(strsplit(INTERACTIONS, ":", fixed = TRUE)))
+stopifnot(all(int_mains %in% all_preds))
+protected <- unique(c(PROTECT, FIXED, int_mains))
+
+vif_of <- function(X) {
+  v <- tryCatch(diag(solve(cor(X))), error = function(e) rep(Inf, ncol(X)))
+  setNames(v, colnames(X))
+}
+
+## Drop exact linear combinations, then the highest-VIF unprotected predictor
+## until every VIF is below `thresh`
+vif_stepdown <- function(X, thresh, protected) {
+  log <- tibble(step = integer(), dropped = character(), vif = numeric())
+  q <- qr(scale(X), tol = 1e-7)
+  if (q$rank < ncol(X)) {
+    aliased <- setdiff(colnames(X)[q$pivot[-seq_len(q$rank)]], protected)
+    log <- add_row(log, step = seq_along(aliased), dropped = aliased, vif = Inf)
+    X <- X[, setdiff(colnames(X), aliased), drop = FALSE]
+  }
+  repeat {
+    v <- vif_of(X)
+    cand <- v[setdiff(names(v), protected)]
+    if (!is.finite(thresh) || length(cand) == 0 || max(v) < thresh || ncol(X) <= 2) break
+    worst <- names(which.max(cand))
+    log <- add_row(log, step = nrow(log) + 1L, dropped = worst, vif = max(cand))
+    X <- X[, setdiff(colnames(X), worst), drop = FALSE]
+  }
+  list(dropped = log, vif = v)
+}
+
+vs <- vif_stepdown(as.matrix(dat[all_preds]), VIF_MAX, protected)
+POOL <- names(vs$vif)
+
+mdat <- dat |> mutate(across(all_of(POOL), \(v) as.numeric(scale(v))))
+
+if (nrow(vs$dropped)) {
+  print(kable(vs$dropped, digits = 2, caption = sprintf("Dropped by the VIF screen (VIF_MAX = %s)", VIF_MAX)))
+}
+tibble(predictor = POOL, level = pred_level(POOL), VIF = vs$vif,
+       protected = POOL %in% protected) |>
+  arrange(level, desc(VIF)) |>
+  kable(digits = 2, caption = sprintf("Candidate pool: %d predictors", length(POOL)))
+
+rho <- cor(mdat[POOL], method = "spearman")
+idx <- which(abs(rho) >= COR_MAX & upper.tri(rho), arr.ind = TRUE)
+cor_pairs <- tibble(a = rownames(rho)[idx[, 1]], b = colnames(rho)[idx[, 2]], rho = rho[idx]) |>
+  arrange(desc(abs(rho)))
+
+## dredge subset matrix: FALSE = these two terms may not share a model.
+## MuMIn reads only the lower triangle.
+subset_mat <- abs(rho) < COR_MAX
+subset_mat[!lower.tri(subset_mat)] <- NA
+
+if (nrow(cor_pairs)) {
+  kable(cor_pairs, digits = 2,
+        caption = sprintf("Pairs with |ρ| ≥ %.2f: never in the same model", COR_MAX))
+}
+```
+
+### 3.2 Dredge
+
+```{r dredge-fns}
+## Global model: all pool terms + interactions + the site intercept
+global_formula <- function(resp) {
+  reformulate(c(POOL, INTERACTIONS, "(1 | Site_ID)"), response = resp)
+}
+
+dredge_subset <- if (nrow(cor_pairs)) subset_mat
+
+## Dredge one response on one data set. The formula, data and control are
+## inlined into the lmer() call, so dredge and get.models() can re-fit any
+## sub-model from any environment (CV fold, forked worker, later chunks).
+run_dredge <- function(resp, d, evaluate = TRUE) {
+  g <- suppressMessages(eval(bquote(lmer(.(global_formula(resp)), data = .(d), REML = FALSE,
+                                         control = .(LMER_CTRL)))))
+  suppressMessages(eval(bquote(
+    dredge(g, rank = .(RANK), m.lim = c(M_MIN, M_MAX),
+           fixed = .(if (length(FIXED)) FIXED else NULL),
+           subset = .(dredge_subset), evaluate = .(evaluate))
+  )))
+}
+
+## Parallel map (same approach as GHG_Dredge.qmd): fork where possible,
+## otherwise a socket cluster; N_CORES = 1 runs serially.
+CAN_FORK <- .Platform$OS.type == "unix" && tryCatch({
+  mccollect(mcparallel(TRUE))
+  TRUE
+}, error = function(e) FALSE)
+
+par_cl <- NULL
+
+DREDGE_EXPORTS <- c("mdat", "run_dredge", "global_formula", "dredge_subset",
+                    "POOL", "INTERACTIONS", "FIXED", "RANK", "M_MIN", "M_MAX",
+                    "LMER_CTRL", "terms_in", "cand_terms", "null_gain")
+
+par_map <- function(X, FUN, export = character()) {
+  if (N_CORES <= 1) return(lapply(X, FUN))
+  if (CAN_FORK) {
+    out <- mclapply(X, FUN, mc.cores = N_CORES, mc.set.seed = TRUE)
+    err <- keep(out, \(o) inherits(o, "try-error"))
+    if (length(err)) stop("worker failed: ", err[[1]])
+    return(out)
+  }
+  if (is.null(par_cl)) {
+    par_cl <<- makeCluster(N_CORES)
+    clusterEvalQ(par_cl, {
+      suppressPackageStartupMessages({
+        library(dplyr)
+        library(purrr)
+        library(lme4)
+        library(MuMIn)
+      })
+      options(na.action = "na.fail")
+    })
+    clusterSetRNGStream(par_cl, SEED)
+  }
+  clusterExport(par_cl, export, envir = globalenv())
+  parLapply(par_cl, X, FUN)
+}
+
+## Fixed terms dredge can switch on and off. nobars() drops (1 | Site_ID).
+cand_terms <- setdiff(attr(terms(nobars(global_formula("CO2"))), "term.labels"), FIXED)
+
+## Fixed terms in each row of a model.selection table
+terms_in <- function(dd) {
+  cols <- intersect(cand_terms, names(dd))
+  apply(!is.na(as.data.frame(dd)[cols]), 1, \(r) cols[r], simplify = FALSE)
+}
+
+## Rank-criterion gain of the best model over the null (fixed terms only)
+null_gain <- function(dd) {
+  k <- lengths(terms_in(dd))
+  if (!any(k == 0)) return(NA_real_)
+  dd$delta[k == 0][1]
+}
+
+model_label <- function(tt) {
+  fx <- if (length(FIXED)) sprintf("[%s]", paste(FIXED, collapse = " + ")) else character()
+  map_chr(tt, \(t) {
+    parts <- c(fx, t)
+    if (length(parts)) paste(parts, collapse = " + ") else "(null)"
+  })
+}
+
+## Marginal and conditional R2 of a merMod
+r2_glmm <- function(m) {
+  r2 <- suppressWarnings(r.squaredGLMM(m))
+  c(R2m = unname(r2[1, "R2m"]), R2c = unname(r2[1, "R2c"]))
+}
+
+## Rough cost: models per dredge x seconds per fit
+n_models <- length(run_dredge("CO2", mdat, evaluate = FALSE))
+t_fit <- system.time(for (i in 1:20) suppressMessages(
+  lmer(global_formula("CO2"), mdat, REML = FALSE, control = LMER_CTRL)))[["elapsed"]] / 20
+n_folds <- switch(CV_SCHEME, site = 48, ecoregion = nlevels(dat$Ecoregion), none = 0, NA)
+cat(sprintf(paste0(
+  "%s parallel backend, %d cores\n",
+  "%d models per dredge, ~%.0f ms per fit (global model) -> ~%.1f min per dredge\n",
+  "Full run: %d dredges for 2 responses (1 + %d permutations + %s CV folds)\n"),
+  if (N_CORES <= 1) "Serial" else if (CAN_FORK) "Forked" else "Socket-cluster", N_CORES,
+  n_models, 1000 * t_fit, n_models * t_fit / 60,
+  2 * (1 + N_PERM + ifelse(is.na(n_folds), 10, n_folds)), N_PERM,
+  ifelse(is.na(n_folds), "~10", n_folds)))
+```
+
+```{r dredge-run}
+dd_list <- map(RESPONSES, \(r) run_dredge(r, mdat))
+
+tibble(response = RESP_LABELS[names(dd_list)],
+       models_fitted = map_int(dd_list, nrow),
+       top_set = map_int(dd_list, \(dd) sum(dd$delta < DELTA_TOP)),
+       best_model = map_chr(dd_list, \(dd) model_label(terms_in(dd)[1])),
+       best_weight = map_dbl(dd_list, \(dd) dd$weight[1]),
+       null_rank = map_int(dd_list, \(dd) which(lengths(terms_in(dd)) == 0)[1]),
+       null_delta = map_dbl(dd_list, null_gain)) |>
+  kable(digits = 3, caption = sprintf("Dredge summary (%s, at most %d fixed terms)", RANK, M_MAX))
+```
+
+### 3.3 Top model sets
+
+`sd_site` is the site random-intercept SD left after the fixed effects. If
+site-level predictors explain site differences, it shrinks relative to the
+null model in Section 2. `singular` = the site variance was estimated at 0.
+
+```{r top-sets, results = "asis"}
+for (nm in names(dd_list)) {
+  dd <- dd_list[[nm]]
+  top <- dd[dd$delta < DELTA_TOP, ]
+  fits <- get.models(top, subset = TRUE)
+  r2 <- map(fits, r2_glmm)
+  tibble(model = model_label(terms_in(top)), df = top$df,
+         R2m = map_dbl(r2, "R2m"), R2c = map_dbl(r2, "R2c"),
+         sd_site = map_dbl(fits, sd_site),
+         singular = map_lgl(fits, isSingular),
+         !!RANK := top[[RANK]], delta = top$delta, weight = top$weight) |>
+    kable(digits = 3, caption = sprintf("%s: top set (delta < %g)", RESP_LABELS[nm], DELTA_TOP)) |>
+    print()
+  cat("\n\n")
+}
+```
+
+### 3.4 Predictor importance (summed weights)
+
+Summed Akaike weight over all models containing each predictor. Green bars
+are visit-level (within-site) predictors. The tick is the expected sum if
+every model had equal weight.
+
+```{r importance, fig.height=6}
+imp <- imap_dfr(dd_list, function(dd, nm) {
+  tt <- terms_in(dd)
+  tibble(response = nm, term = cand_terms, level = pred_level(cand_terms),
+         sw = map_dbl(cand_terms, \(t) sum(dd$weight[map_lgl(tt, \(x) t %in% x)])),
+         equal_w = map_dbl(cand_terms, \(t) mean(map_lgl(tt, \(x) t %in% x))))
+})
+
+imp_order <- imp |> group_by(term) |> summarise(m = max(sw)) |> arrange(m) |> pull(term)
+
+ggplot(imp, aes(sw, factor(term, levels = imp_order))) +
+  geom_col(aes(fill = level), width = 0.7) +
+  geom_point(aes(x = equal_w), shape = 124, size = 4, color = "#3a3936") +
+  facet_wrap(~response, labeller = labeller(response = RESP_LABELS)) +
+  scale_fill_manual(values = LEVEL_COLS) +
+  scale_x_continuous(limits = c(0, 1), expand = expansion(mult = c(0, 0.02))) +
+  labs(title = "Summed model weight per predictor",
+       subtitle = "Tick = expected sum if all models were equally supported",
+       x = "Summed weight", y = NULL, fill = "Predictor level")
+```
+
+### 3.5 Coefficients: top model and model average
+
+Full model average over the top set (absent terms count as 0). Wald 95%
+intervals, not adjusted for the selection step.
+
+```{r coefs, fig.height=6}
+coef_df <- imap_dfr(dd_list, function(dd, nm) {
+  best <- get.models(dd, 1)[[1]]
+  ci <- confint(best, parm = "beta_", method = "Wald")
+  out <- tibble(response = nm, model = "top model", term = names(fixef(best)),
+                estimate = unname(fixef(best)), lo = ci[, 1], hi = ci[, 2])
+  if (sum(dd$delta < DELTA_TOP) > 1) {
+    av <- model.avg(dd, subset = delta < DELTA_TOP)
+    cf <- coef(av, full = TRUE)
+    ci <- confint(av, full = TRUE)
+    out <- bind_rows(out, tibble(response = nm, model = "top-set average", term = names(cf),
+                                 estimate = unname(cf), lo = ci[names(cf), 1], hi = ci[names(cf), 2]))
+  }
+  out
+}) |>
+  filter(term != "(Intercept)")
+
+if (nrow(coef_df)) {
+  ggplot(coef_df, aes(estimate, term, color = model)) +
+    geom_vline(xintercept = 0, color = "#c3c2b7") +
+    geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0,
+                   position = position_dodge(width = 0.5)) +
+    geom_point(size = 2.4, position = position_dodge(width = 0.5)) +
+    facet_wrap(~response, scales = "free_x", labeller = labeller(response = RESP_LABELS)) +
+    scale_color_manual(values = c(`top model` = "#2a78d6", `top-set average` = "#898781")) +
+    labs(title = "Coefficients per 1 SD of each predictor",
+         subtitle = "95% Wald intervals, not adjusted for model selection",
+         x = "Estimate", y = NULL, color = NULL)
+} else {
+  cat("Both top models are the null model: no coefficients to show.\n")
+}
+```
+
+### 3.6 Top-model diagnostics
+
+Visit-level residuals (after the site intercept) and the site intercepts
+themselves. Both should look roughly normal.
+
+```{r diag, fig.height=7}
+top_fits <- map(dd_list, \(dd) get.models(dd, 1)[[1]])
+
+diag_d <- imap_dfr(top_fits, \(m, nm) tibble(
+  response = nm, fitted = fitted(m), resid = residuals(m), Wetland_Type = mdat$Wetland_Type))
+re_d <- imap_dfr(top_fits, \(m, nm) tibble(response = nm, ranef = ranef(m)$Site_ID[, 1]))
+
+rf <- ggplot(diag_d, aes(fitted, resid)) +
+  geom_hline(yintercept = 0, color = "#c3c2b7") +
+  geom_point(aes(color = Wetland_Type, shape = Wetland_Type), size = 2) +
+  facet_wrap(~response, scales = "free", labeller = labeller(response = RESP_LABELS)) +
+  scale_color_manual(values = WT_COLS) +
+  scale_shape_manual(values = WT_SHAPES) +
+  labs(title = "Top model: visit residuals vs fitted", x = "Fitted", y = "Residual",
+       color = "Wetland type", shape = "Wetland type")
+
+qq_resid <- ggplot(diag_d, aes(sample = resid)) +
+  stat_qq_line(color = "#c3c2b7") +
+  stat_qq(size = 1.6, color = "#2a78d6") +
+  facet_wrap(~response, scales = "free", labeller = labeller(response = RESP_LABELS)) +
+  labs(title = "Visit residuals: normal Q-Q", x = "Theoretical", y = "Sample")
+
+qq_re <- ggplot(re_d, aes(sample = ranef)) +
+  stat_qq_line(color = "#c3c2b7") +
+  stat_qq(size = 1.6, color = "#898781") +
+  facet_wrap(~response, scales = "free", labeller = labeller(response = RESP_LABELS)) +
+  labs(title = "Site intercepts: normal Q-Q", x = "Theoretical", y = "Sample")
+
+rf / (qq_resid | qq_re)
+```
+
+## 4. Is the selected model better than chance?
+
+### 4.1 Restricted permutation test
+
+Each shuffle moves the response of whole sites (both visits together) to
+other sites, then swaps the two visits within each site with probability
+0.5. This keeps the site variance (the null model is unchanged) and breaks
+the link to both site-level and visit-level predictors. Dredge is re-run
+with the same settings. p = share of shuffles whose best model beats the
+null by at least as much as the real data's.
+
+```{r perm}
+## Rows are ordered site by site, rounds 1 and 2 adjacent (checked in Section 1)
+shuffle_paired <- function(y) {
+  Y <- matrix(y, nrow = 2)                 # column = site, rows = rounds
+  Y <- Y[, sample(ncol(Y)), drop = FALSE]  # move whole sites
+  flip <- runif(ncol(Y)) < 0.5             # swap visits within sites
+  Y[, flip] <- Y[2:1, flip]
+  as.vector(Y)
+}
+
+perm_res <- if (N_PERM > 0) {
+  imap(RESPONSES, function(r, nm) {
+    obs <- null_gain(dd_list[[nm]])
+    perm <- unlist(par_map(seq_len(N_PERM), function(i) {
+      d <- mdat
+      d[[r]] <- shuffle_paired(d[[r]])
+      null_gain(run_dredge(r, d))
+    }, export = c(DREDGE_EXPORTS, "shuffle_paired")))
+    list(obs = obs, perm = perm, p = (sum(perm >= obs) + 1) / (N_PERM + 1))
+  })
+}
+```
+
+```{r perm-plot, fig.height=4}
+if (N_PERM > 0) {
+  perm_long <- imap_dfr(perm_res, \(p, nm) tibble(response = nm, gain = p$perm))
+  perm_obs <- imap_dfr(perm_res, \(p, nm) tibble(
+    response = nm, gain = p$obs, lab = sprintf("observed = %.1f\np = %.3f", p$obs, p$p)))
+
+  print(
+    ggplot(perm_long, aes(gain)) +
+      geom_histogram(aes(fill = response), bins = 25, color = "white", show.legend = FALSE) +
+      geom_vline(data = perm_obs, aes(xintercept = gain), color = "#3a3936", linewidth = 0.8) +
+      geom_text(data = perm_obs, aes(x = gain, y = Inf, label = lab),
+                hjust = -0.08, vjust = 1.3, size = 3.3, color = "#3a3936") +
+      facet_wrap(~response, scales = "free", labeller = labeller(response = RESP_LABELS)) +
+      scale_fill_manual(values = RESP_COLS) +
+      labs(title = sprintf("Best-model gain over the null: real data vs %d shuffles", N_PERM),
+           x = sprintf("Null model delta %s", RANK), y = "Shuffles")
+  )
+}
+```
+
+### 4.2 Nested cross-validation (new sites)
+
+In each fold, dredge is re-run on the training sites, and the selected
+model's fixed effects predict both visits of the held-out sites
+(`re.form = NA`). Baseline = training mean. **Predictive R² ≤ 0 means no
+better than that mean.** Visit-level predictors still help here if
+within-site weather matters, because the held-out visits' weather is known.
+
+```{r cv-folds}
+site_xy <- mdat |> distinct(Site_ID, x, y, Ecoregion)
+site_fold <- switch(CV_SCHEME,
+  site = seq_len(nrow(site_xy)),
+  spatial = cutree(hclust(dist(site_xy[c("x", "y")]) / 1000, method = "complete"), h = CV_BLOCK_KM),
+  ecoregion = as.integer(site_xy$Ecoregion),
+  none = NULL
+)
+cv_folds <- if (!is.null(site_fold)) site_fold[match(mdat$Site_ID, site_xy$Site_ID)]
+if (!is.null(cv_folds)) {
+  cat(sprintf("%d folds; held-out sites per fold: min %d, median %g, max %d\n",
+              n_distinct(site_fold), min(table(site_fold)), median(table(site_fold)),
+              max(table(site_fold))))
+}
+```
+
+```{r cv}
+predict_fold <- function(dd, newdata) {
+  if (CV_PREDICT == "average" && sum(dd$delta < DELTA_TOP) > 1) {
+    predict(model.avg(get.models(dd, subset = delta < DELTA_TOP)), newdata = newdata,
+            full = TRUE, re.form = NA)
+  } else {
+    predict(get.models(dd, 1)[[1]], newdata = newdata, re.form = NA)
+  }
+}
+
+cv_res <- if (!is.null(cv_folds)) {
+  imap(RESPONSES, function(r, nm) {
+    folds <- par_map(sort(unique(cv_folds)), function(k) {
+      test <- cv_folds == k
+      dd <- run_dredge(r, droplevels(mdat[!test, ]))
+      list(pred = tibble(row = which(test), pred = unname(predict_fold(dd, mdat[test, ])),
+                         base = mean(mdat[[r]][!test])),
+           terms = terms_in(dd)[[1]])
+    }, export = c(DREDGE_EXPORTS, "cv_folds", "predict_fold", "CV_PREDICT", "DELTA_TOP"))
+    pred <- map_dfr(folds, "pred") |>
+      arrange(row) |>
+      mutate(obs = mdat[[r]][row], Site_ID = mdat$Site_ID[row],
+             Wetland_Type = mdat$Wetland_Type[row])
+    list(pred = pred, terms = map(folds, "terms"))
+  })
+}
+```
+
+Two scores: per visit, and per site (mean of the two visits' observed and
+predicted values, comparable to `GHG_Dredge.qmd`).
+
+```{r cv-table}
+pred_r2 <- function(obs, pred, base) 1 - sum((obs - pred)^2) / sum((obs - base)^2)
+
+if (!is.null(cv_folds)) {
+  imap_dfr(cv_res, function(cv, nm) {
+    site <- cv$pred |> group_by(Site_ID) |> summarise(across(c(obs, pred, base), mean))
+    r2 <- r2_glmm(get.models(dd_list[[nm]], 1)[[1]])
+    tibble(response = RESP_LABELS[nm],
+           RMSE_selected = with(cv$pred, sqrt(mean((obs - pred)^2))),
+           RMSE_mean = with(cv$pred, sqrt(mean((obs - base)^2))),
+           cv_R2_visit = with(cv$pred, pred_r2(obs, pred, base)),
+           cv_R2_site = with(site, pred_r2(obs, pred, base)),
+           in_sample_R2m = r2[["R2m"]], in_sample_R2c = r2[["R2c"]])
+  }) |>
+    kable(digits = 3, caption = sprintf("Nested CV (%s folds, %s prediction, fixed effects only)",
+                                        CV_SCHEME, CV_PREDICT))
+}
+```
+
+```{r cv-plot, fig.height=4.5}
+if (!is.null(cv_folds)) {
+  cvp <- imap_dfr(cv_res, \(cv, nm) mutate(cv$pred, response = nm))
+  ggplot(cvp, aes(obs, pred)) +
+    geom_abline(color = "#c3c2b7") +
+    geom_line(aes(group = Site_ID), color = "#e1e0d9") +
+    geom_point(aes(color = Wetland_Type, shape = Wetland_Type), size = 2) +
+    facet_wrap(~response, scales = "free", labeller = labeller(response = RESP_LABELS)) +
+    scale_color_manual(values = WT_COLS) +
+    scale_shape_manual(values = WT_SHAPES) +
+    labs(title = "Held-out predictions from the nested CV",
+         subtitle = "Solid = 1:1; grey segments join a site's two visits",
+         x = "Observed", y = "Predicted (held out, fixed effects only)",
+         color = "Wetland type", shape = "Wetland type")
+}
+```
+
+### 4.3 Selection stability across folds
+
+```{r stability, fig.height=5}
+if (!is.null(cv_folds)) {
+  stab <- imap_dfr(cv_res, function(cv, nm) {
+    tibble(response = nm, term = cand_terms, level = pred_level(cand_terms),
+           freq = map_dbl(cand_terms, \(t) mean(map_lgl(cv$terms, \(x) t %in% x))))
+  }) |>
+    group_by(term) |> filter(max(freq) > 0) |> ungroup()
+
+  stab_order <- stab |> group_by(term) |> summarise(m = max(freq)) |> arrange(m) |> pull(term)
+
+  print(
+    ggplot(stab, aes(freq, factor(term, levels = stab_order))) +
+      geom_col(aes(fill = level), width = 0.7) +
+      facet_wrap(~response, labeller = labeller(response = RESP_LABELS)) +
+      scale_fill_manual(values = LEVEL_COLS) +
+      scale_x_continuous(limits = c(0, 1), labels = scales::percent) +
+      labs(title = "Share of CV folds whose best model includes each predictor",
+           subtitle = "Predictors never selected are omitted", x = NULL, y = NULL,
+           fill = "Predictor level")
+  )
+
+  imap_dfr(cv_res, \(cv, nm) tibble(response = RESP_LABELS[nm], model = model_label(cv$terms))) |>
+    count(response, model, sort = TRUE) |>
+    group_by(response) |> slice_head(n = 5) |> ungroup() |>
+    kable(caption = "Most common best models across CV folds (top 5 per response)")
+}
+```
+
+### 4.4 Summary
+
+```{r summary}
+tibble(
+  response = RESP_LABELS[names(dd_list)],
+  best_model = map_chr(dd_list, \(dd) model_label(terms_in(dd)[1])),
+  R2m = map_dbl(top_fits, \(m) r2_glmm(m)[["R2m"]]),
+  gain_over_null = map_dbl(dd_list, null_gain),
+  perm_p = if (N_PERM > 0) map_dbl(perm_res, "p") else NA_real_,
+  cv_R2_site = if (!is.null(cv_folds)) {
+    map_dbl(cv_res, \(cv) {
+      s <- cv$pred |> group_by(Site_ID) |> summarise(across(c(obs, pred, base), mean))
+      pred_r2(s$obs, s$pred, s$base)
+    })
+  } else NA_real_
+) |>
+  kable(digits = 3, caption = "Does the dredge selection hold up?")
+```
+
+## 5. Candidate formulas
+
+Hand-picked fixed effects from `CANDIDATES`, each fitted with
+`(1 | Site_ID)` and compared with the null model, its own fixed effects
+without interactions, and dredge's best model. Same caveat as in
+`GHG_Dredge.qmd`: in-sample numbers and the CV assume the formula was chosen
+before seeing the data.
+
+```{r cand, results = "asis"}
+if (length(CANDIDATES)) {
+cdat <- dat |> mutate(across(all_of(all_preds), \(v) as.numeric(scale(v))))
+cand_resp <- function(f) all.vars(f[[2]])
+cand_vars <- function(f) all.vars(f[[3]])
+resp_name <- function(f) names(RESPONSES)[RESPONSES == cand_resp(f)]
+add_re <- function(f) update(f, . ~ . + (1 | Site_ID))
+## Formula and data inlined into the call, so drop1() can refit it
+fit_re <- function(f, d = cdat) {
+  suppressMessages(eval(bquote(lmer(.(add_re(f)), data = .(d), REML = FALSE,
+                                    control = .(LMER_CTRL)))))
+}
+
+walk(CANDIDATES, function(f) {
+  stopifnot(cand_resp(f) %in% RESPONSES)
+  bad <- setdiff(cand_vars(f), names(cdat))
+  if (length(bad)) stop("unknown predictor(s): ", paste(bad, collapse = ", "))
+})
+
+cdat_site <- cdat |> distinct(Site_ID, x, y, Ecoregion)
+cand_folds <- list(
+  site = as.integer(cdat$Site_ID),
+  spatial = cutree(hclust(dist(cdat_site[c("x", "y")]) / 1000, method = "complete"),
+                   h = CV_BLOCK_KM)[match(cdat$Site_ID, cdat_site$Site_ID)],
+  ecoregion = as.integer(cdat$Ecoregion)
+)
+cv_fixed <- function(f, folds) {
+  y <- cdat[[cand_resp(f)]]
+  pred <- base <- numeric(length(y))
+  for (k in unique(folds)) {
+    test <- folds == k
+    pred[test] <- predict(fit_re(f, droplevels(cdat[!test, ])), newdata = cdat[test, ], re.form = NA)
+    base[test] <- mean(y[!test])
+  }
+  pred_r2(y, pred, base)
+}
+
+iwalk(CANDIDATES, function(f, nm) {
+  r <- cand_resp(f)
+  comp <- list(
+    `null` = reformulate("1", response = r),
+    `main effects only` = reformulate(cand_vars(f), response = r),
+    `dredge best` = nobars(formula(get.models(dd_list[[resp_name(f)]], 1)[[1]])),
+    candidate = f
+  )
+  comp <- comp[!duplicated(map_chr(comp, \(x) paste(deparse(x), collapse = "")))]
+  imap_dfr(comp, function(fc, lab) {
+    m <- fit_re(fc)
+    r2 <- r2_glmm(m)
+    tibble(model = lab, formula = paste(deparse(fc[[3]], width.cutoff = 500), collapse = ""),
+           k = length(fixef(m)), R2m = r2[["R2m"]], R2c = r2[["R2c"]], AICc = AICc(m),
+           sd_site = sd_site(m),
+           cv_site = cv_fixed(fc, cand_folds$site),
+           cv_spatial = cv_fixed(fc, cand_folds$spatial),
+           cv_ecoregion = cv_fixed(fc, cand_folds$ecoregion))
+  }) |>
+    kable(digits = 3, caption = sprintf("%s (%s): comparison (cv_* = visit-level predictive R²)",
+                                        nm, RESP_LABELS[resp_name(f)])) |>
+    print()
+  cat("\n\n")
+
+  m <- fit_re(f)
+  d1 <- drop1(m, test = "Chisq")
+  tibble(term = rownames(d1)[-1], LRT = d1$LRT[-1], p = d1$`Pr(Chi)`[-1]) |>
+    kable(digits = 3, caption = sprintf("%s: likelihood-ratio tests of the highest-order terms", nm)) |>
+    print()
+  cat("\n\n")
+  cf <- summary(m)$coefficients
+  tibble(term = rownames(cf), estimate = cf[, 1], SE = cf[, 2], t = cf[, 3]) |>
+    kable(digits = 3, caption = sprintf("%s: fixed effects (per 1 SD)", nm)) |>
+    print()
+  cat("\n\n")
+})}
+```
+
+## 6. Typical-summer-day prediction
+
+Predictions at each site with `<v>_dev = 0` and `<v>_site` at the reference
+value (`REF_WEATHER`, default the median of the site means), from the top
+model's fixed effects (`re.form = NA`, as for an unsampled location). Site-level
+predictors keep their observed values. On the model scale; for log-shifted
+CH4, `exp(prediction) - c` is a median, not a mean, flux.
+
+```{r upscale, fig.height=4}
+if (WEATHER_SPLIT) {
+  site_vars <- paste0(visit_short, "_site")
+  ref <- map_dbl(set_names(site_vars), \(v) {
+    if (v %in% names(REF_WEATHER)) REF_WEATHER[[v]] else median(dat[[v]][c(TRUE, FALSE)])
+  })
+  print(kable(tibble(variable = names(ref), reference_raw = ref), digits = 2,
+              caption = "Reference weather (raw units)"))
+
+  ## Reference data on the standardized scale of mdat
+  ref_dat <- dat[c(TRUE, FALSE), ]
+  for (v in site_vars) ref_dat[[v]] <- ref[[v]]
+  for (v in paste0(visit_short, "_dev")) ref_dat[[v]] <- 0
+  for (v in intersect(POOL, names(ref_dat))) {
+    ref_dat[[v]] <- (ref_dat[[v]] - mean(dat[[v]])) / sd(dat[[v]])
+  }
+
+  up <- imap_dfr(top_fits, \(m, nm) tibble(
+    response = nm, Site_ID = ref_dat$Site_ID, Wetland_Type = ref_dat$Wetland_Type,
+    typical = unname(predict(m, newdata = ref_dat, re.form = NA)),
+    observed_site_mean = tapply(mdat[[RESPONSES[[nm]]]], mdat$Site_ID, mean)[as.character(ref_dat$Site_ID)]))
+
+  ggplot(up, aes(observed_site_mean, typical)) +
+    geom_abline(color = "#c3c2b7") +
+    geom_point(aes(color = Wetland_Type, shape = Wetland_Type), size = 2) +
+    facet_wrap(~response, scales = "free", labeller = labeller(response = RESP_LABELS)) +
+    scale_color_manual(values = WT_COLS) +
+    scale_shape_manual(values = WT_SHAPES) +
+    labs(title = "Top model at reference weather vs observed site mean",
+         x = "Observed site mean (model scale)", y = "Predicted, typical summer day",
+         color = "Wetland type", shape = "Wetland type")
+}
+```
+
+```{r session}
+if (!is.null(par_cl)) {
+  stopCluster(par_cl)
+  par_cl <- NULL
+}
+sessionInfo()
+```
