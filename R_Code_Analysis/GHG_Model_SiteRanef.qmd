@@ -166,7 +166,7 @@ options(na.action = "na.fail") # dredge requires this
 
 RASTER_CSV <- here("Data/GHG/NYDEC_GHG_Site_RasterPredictors.csv")
 CLIMATE_CSV <- here("Data/GHG/NYDEC_GHG_Site_Climate.csv")
-SITES_GPKG <- here("Data/GHG/NYDEC_GHG_all_site_data_GPSupd_6347.gpkg")
+SITES_GPKG <- here("Data/GHG/NYDEC_GHG_Sites_EcoEPA_6347.gpkg")
 
 ## Skipping the gradient check at convergence speeds up lmer ~30%. The fits
 ## are simple (one variance component), so convergence problems are rare.

@@ -61,7 +61,7 @@ library(here)
 ## --- Settings ---------------------------------------------------------------
 RASTER_CSV <- here("Data/GHG/NYDEC_GHG_Site_RasterPredictors.csv")
 CLIMATE_CSV <- here("Data/GHG/NYDEC_GHG_Site_Climate.csv")
-SITES_GPKG <- here("Data/GHG/NYDEC_GHG_all_site_data_GPSupd_6347.gpkg")
+SITES_GPKG <- here("Data/GHG/NYDEC_GHG_Sites_EcoEPA_6347.gpkg")
 
 FOCAL_WINDOW <- 10 # window (m) used for the detailed single-window plots
 COR_FLAG <- 0.7 # |rho| treated as "highly correlated"

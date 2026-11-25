@@ -23,6 +23,8 @@ Other data sources have come by extracting climate data from Google Earth Engine
 `Data/` Holds all data 
 
 - `Data/GHG/` holds GHG data observations. Right now it's a bit messy but the main data sources should be `NYDEC_GHG_Sites_6347.gpkg` which contains field-collected predictor data but **not** geospatial predictor data. The `Latitude` and `Longitude` locations in `NYDEC_GHG_Sites_6347.gpkg` provide location for these observations that can be used to extract geospatial predictors.
+- `NYDEC_GHG_Sites_EcoEPA_6347.gpkg` (2026-11-25) is the site file used by the modeling workflow: GPS-corrected locations, flux observations (96 rows = 48 sites x 2 rounds), and `Ecoregion_EPA`, the EPA Level III ecoregion name. `GHG_Raster_Extraction.R` reads it and writes `NYDEC_GHG_Site_RasterPredictors.csv`, where `Ecoregion` is the EPA name, `US_L3CODE` its code, and `Ecoregion_NYDEC` the original sampling-stratum label (one-to-one with the four sampled EPA ecoregions).
+- `Data/Ecoregions/NY_ECO_L3_6347.gpkg` holds the EPA Level III ecoregion polygons for NY (9 ecoregions; 4 sampled). These zone the statewide upscaling.
 - Other iterations of ``NYDEC_GHG_Sites_6347*` have geospatial data extracted already, with the modeling dataframe output as `NYDEC_GHG_Model_Data.csv`. However these should be re-processed with new predictor extraction strategies (See TBD)
 
 `R_Code_Analysis/` holds modeling analysis scripts, and currently (11/17/2026) 

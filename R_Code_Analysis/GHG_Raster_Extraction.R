@@ -36,6 +36,11 @@
 ### Raster predictors are static, so output is one row per site (Site_ID), to
 ### be joined to the per-round GHG data in GHG_Processing.R.
 ###
+### Ecoregion: `Ecoregion` is the EPA Level III name (US_L3NAME) from the
+### sites file, checked against a spatial join to the EPA polygons;
+### `US_L3CODE` is its code. The original NYDEC sampling-stratum label is kept
+### as `Ecoregion_NYDEC` (one-to-one with the four sampled EPA ecoregions).
+###
 ### Run from the project root with an R that has terra + sf (R 4.4.3 on BioHPC):
 ###   /programs/R-4.4.3/bin/Rscript R_Code_Analysis/GHG_Raster_Extraction.R
 
@@ -48,7 +53,11 @@ suppressPackageStartupMessages({
 ## --- Settings ---------------------------------------------------------------
 DATA_ROOT <- "/ibstorage/anthony/NYS_Wetlands_Data"
 PROD_PROBS <- "/ibstorage/anthony/NYS_Wetlands_Prod/Data/HUC_DL_Predictions_Prod/p027_focal_bin_p21/ensemble_cal"
-SITES <- "Data/GHG/NYDEC_GHG_all_site_data_GPSupd_6347.gpkg"
+## Sites with GPS corrections and EPA Level III ecoregion labels (Ecoregion_EPA)
+SITES <- "Data/GHG/NYDEC_GHG_Sites_EcoEPA_6347.gpkg"
+## EPA Level III ecoregions clipped to NY; used to check the site labels and add
+## the US_L3CODE that the upscaling step joins on
+ECOREGIONS <- "Data/Ecoregions/NY_ECO_L3_6347.gpkg"
 HUC_ZONES <- file.path(
   DATA_ROOT,
   "Data/NY_HUCS/NY_Cluster_Zones_250_CROP_NAomit_6347.gpkg"
@@ -98,7 +107,18 @@ sites <- st_read(SITES, quiet = TRUE) |>
   group_by(Site_ID) |>
   slice(1) |> # both rounds share coordinates
   ungroup() |>
-  select(Site_ID, Ecoregion, Wetland_Type)
+  select(Site_ID, Ecoregion = Ecoregion_EPA, Ecoregion_NYDEC = Ecoregion, Wetland_Type)
+
+## Check the EPA labels against the polygons and add the L3 code
+eco <- st_read(ECOREGIONS, quiet = TRUE) |>
+  select(US_L3CODE, US_L3NAME) |>
+  st_transform(st_crs(sites))
+sites <- st_join(sites, eco, join = st_within)
+if (anyDuplicated(sites$Site_ID) || anyNA(sites$US_L3NAME) ||
+    any(sites$US_L3NAME != sites$Ecoregion)) {
+  stop("Site Ecoregion_EPA labels don't match a spatial join to ", ECOREGIONS)
+}
+sites <- sites |> select(-US_L3NAME) |> relocate(US_L3CODE, .after = Ecoregion)
 
 zones <- st_read(HUC_ZONES, quiet = TRUE) |> select(huc12, cluster)
 sites <- st_join(sites, zones, join = st_within)

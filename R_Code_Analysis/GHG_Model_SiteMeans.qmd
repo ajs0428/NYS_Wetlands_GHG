@@ -1,6 +1,6 @@
 ---
 title: "GHG flux models: site means"
-subtitle: "CH4 and CO2 vs. raster and climate predictors"
+subtitle: "CH4 scaling models: ecoregion only vs. ecoregion + site covariates"
 date: today
 format:
   html:
@@ -18,24 +18,46 @@ execute:
 
 ## Purpose and setup
 
-Iteration 2. The models are kept deliberately simple:
+Iteration 3. This notebook picks the CH4 model used for the statewide upscaled
+estimate, and reports how a more complex, site-level model performs by
+comparison. It answers three questions:
 
-* **Response:** site-mean flux (mean of the two sampling rounds), n = 48.
-* **Predictors:** DEM SD, WETprob mean, NDVI mean, CHM mean (raster, `r 10` m
-  window) and PRISM annual precipitation. All are standardized (mean 0, SD 1),
-  so coefficients are the change in the response per 1 SD of the predictor.
-* **CH4 response:** log(CH4 + c), chosen in iteration 1 (Section 2).
-* **No random effect:** the ecoregion random intercept is tested in Section 3
-  and dropped. Models are ordinary `lm()` fits, which use the same formula
-  syntax as lme4 without the `(1 | group)` term.
-* **No wetland type:** the production maps have no wetland classes, so type
-  can't be used for upscaling.
-* **Interactions:** a priori WETprob × NDVI, plus an exploratory screen
-  (Section 4).
-* **Checks:** residual diagnostics, then spatial autocorrelation in the
-  residuals (Section 6).
+1. **Ecoregion model.** How well does `CH4_resp ~ Ecoregion` describe
+   site-mean CH4? This is the model used for upscaling.
+2. **Fixed or random ecoregion?** Does `CH4_resp ~ 1 + (1 | Ecoregion)` do
+   better than ecoregion as a fixed effect? This matters for the five EPA
+   Level III ecoregions in New York with no sites (Section 1). A fixed-effect
+   model has no coefficient for those areas. A random-effect model predicts
+   the population mean there.
+3. **Complex model.** How much more does
+   `CH4_resp ~ Ecoregion + WETprob_mean * DMV_sd + GEO_modefrac` explain,
+   in-sample and out-of-sample? This is the model "fit more directly to the
+   data" and is reported alongside the upscaled estimate. It is not used to
+   upscale.
 
-Exploratory results behind these choices are in `GHG_Raster_EDA.qmd`.
+Design:
+
+* **Ecoregion:** EPA Level III ecoregion (`US_L3NAME`), from
+  `NYDEC_GHG_Sites_EcoEPA_6347.gpkg` via the raster predictor CSV. These are
+  the labels of the statewide polygons in `Data/Ecoregions/NY_ECO_L3_6347.gpkg`
+  that the upscaling uses. The four sampled EPA ecoregions map one-to-one to
+  the original NYDEC strata (`Ecoregion_NYDEC`), so model fits are unchanged
+  by the relabel.
+* **Response:** site-mean CH4 (mean of the two sampling rounds), n = 48,
+  12 sites in each of 4 sampled ecoregions. Modeled as `CH4_resp = log(CH4 + c)`, the
+  same transform as `GHG_Dredge.qmd` and `GHG_Model_SiteRanef.qmd`.
+* **Covariates:** 10 m window raster statistics, standardized (mean 0, SD 1).
+  The scaling constants are saved in `z_scaling` so the upscaling rasters can
+  be put on the same scale.
+* **Not covered here:** uncertainty in the upscaled estimate, the
+  back-transformation from the log scale to mean flux, and wetland area
+  weighting. Those come in the next notebook. Predictions below are on the
+  model (log) scale. Back-transformed values are medians, not means.
+
+The complex model's structure came out of the all-subsets search in
+`GHG_Dredge.qmd`. Cross-validating a fixed formula here leaves out that
+selection step, so its cross-validated R² is still somewhat optimistic. The
+nested CV in `GHG_Dredge.qmd` is the honest check.
 
 ```{r setup}
 library(sf)
@@ -48,31 +70,33 @@ library(knitr)
 library(here)
 library(lme4)
 library(lmerTest) # p-values for lmer fixed effects (Satterthwaite)
+library(MuMIn)    # r.squaredGLMM, AICc
 
 ## --- Settings ---------------------------------------------------------------
 RASTER_CSV <- here("Data/GHG/NYDEC_GHG_Site_RasterPredictors.csv")
-CLIMATE_CSV <- here("Data/GHG/NYDEC_GHG_Site_Climate.csv")
-SITES_GPKG <- here("Data/GHG/NYDEC_GHG_all_site_data_GPSupd_6347.gpkg")
+SITES_GPKG <- here("Data/GHG/NYDEC_GHG_Sites_EcoEPA_6347.gpkg")
+ECO_GPKG <- here("Data/Ecoregions/NY_ECO_L3_6347.gpkg") # EPA Level III, NY
 
 WINDOW <- 10 # raster window (m)
 
-## Predictor columns (before standardizing) -> short names used in models
-PREDICTORS <- c(
-  DEM_sd       = sprintf("DEM_sd_%dm", WINDOW),
+## Covariates of the complex model: short name -> column in RASTER_CSV
+COVARIATES <- c(
   WETprob_mean = sprintf("WETprob_mean_%dm", WINDOW),
-  NDVI_mean    = sprintf("NDVI_mean_%dm", WINDOW),
-  CHM_mean     = sprintf("CHM_mean_%dm", WINDOW),
-  ppt_annual   = "prism_ppt_annual"
+  DMV_sd       = sprintf("DMV_sd_%dm", WINDOW),
+  GEO_modefrac = sprintf("GEO_modefrac_%dm", WINDOW)
 )
 
-ASINH_SCALE <- 0.01 # asinh(CH4 / s): linear below ~s, log-like above
-SHIFT_ADD <- 0.01 # log / Gamma shift: CH4 + |min(CH4)| + SHIFT_ADD
+SHIFT_ADD <- 0.02 # c = |min(CH4)| + SHIFT_ADD (same as GHG_Dredge.qmd)
+
+CV_BLOCK_KM <- 25 # spatial CV: sites grouped within this distance are held out together
+NEIGHBOUR_KM <- 25 # Moran's I neighbourhood (Section 7)
 
 set.seed(1)
 
 ## --- Plot styling (same palette as the EDA notebook) ------------------------
 WT_COLS <- c(EM = "#2a78d6", FO = "#eb6834", SS = "#1baf7a")
 WT_SHAPES <- c(EM = 16, FO = 17, SS = 15)
+ECO_COLS <- c("#2a78d6", "#eb6834", "#1baf7a", "#8d5bd6")
 theme_set(
   theme_minimal(base_size = 11) +
     theme(panel.grid.minor = element_blank(),
@@ -89,161 +113,274 @@ theme_set(
 flux_site <- st_read(SITES_GPKG, quiet = TRUE) |>
   st_drop_geometry() |>
   group_by(Site_ID) |>
-  summarise(CH4 = mean(CH4_avg), CO2 = mean(CO2_avg), .groups = "drop")
-
-## PRISM annual normals are the same for both rounds; take the site mean anyway
-clim_site <- read.csv(CLIMATE_CSV) |>
-  group_by(Site_ID) |>
-  summarise(prism_ppt_annual = mean(prism_ppt_annual), .groups = "drop")
+  summarise(CH4 = mean(CH4_avg), .groups = "drop")
 
 dat <- read.csv(RASTER_CSV, colClasses = c(huc12 = "character")) |>
-  select(Site_ID, Ecoregion, Wetland_Type, x, y, all_of(unname(PREDICTORS[PREDICTORS != "prism_ppt_annual"]))) |>
+  select(Site_ID, Ecoregion, US_L3CODE, Ecoregion_NYDEC, Wetland_Type, x, y,
+         all_of(unname(COVARIATES))) |>
   left_join(flux_site, by = "Site_ID") |>
-  left_join(clim_site, by = "Site_ID") |>
-  rename(all_of(PREDICTORS)) |>
+  rename(all_of(COVARIATES)) |>
   mutate(
     Ecoregion = factor(Ecoregion),
     Wetland_Type = factor(Wetland_Type, levels = names(WT_COLS)),
     ## standardized copies used in the models: z_<name>
-    across(all_of(names(PREDICTORS)), \(v) as.numeric(scale(v)), .names = "z_{.col}")
+    across(all_of(names(COVARIATES)), \(v) as.numeric(scale(v)), .names = "z_{.col}")
   )
 
-stopifnot(nrow(dat) == 48, !anyNA(dat))
-z_preds <- paste0("z_", names(PREDICTORS))
+stopifnot(nrow(dat) == 48, !anyNA(dat), nlevels(dat$Ecoregion) == 4)
+
+## Keep the standardization constants for applying the model to rasters
+z_scaling <- tibble(covariate = names(COVARIATES), column = unname(COVARIATES),
+                    mean = map_dbl(names(COVARIATES), \(v) mean(dat[[v]])),
+                    sd = map_dbl(names(COVARIATES), \(v) sd(dat[[v]])))
+kable(z_scaling, digits = 4, caption = "Covariate standardization constants (z = (x - mean) / sd)")
+
+table(dat$Ecoregion, dat$Wetland_Type) |>
+  kable(caption = "Sites by EPA Level III ecoregion and wetland type")
 ```
 
-### Predictor collinearity
+### EPA ecoregions: sampled and unsampled
 
-```{r pred-check}
-pred_cor <- cor(dat[names(PREDICTORS)], method = "spearman")
-kable(pred_cor, digits = 2, caption = "Spearman ρ among the predictors")
+New York has nine EPA Level III ecoregions. Sites cover four. Wetlands in the
+other five are the **unlabeled** case in this notebook: no model can estimate
+an ecoregion-specific mean there. The areas below are total land area. The
+wetland area in each ecoregion (from the production maps) is what will weight
+the upscaled estimate.
 
-## VIF = diagonal of the inverse correlation matrix
-vif <- diag(solve(cor(dat[z_preds])))
-kable(tibble(predictor = names(PREDICTORS), VIF = vif), digits = 2,
-      caption = "Variance inflation factors (all < 5 is fine)")
+```{r eco-coverage}
+eco_poly <- st_read(ECO_GPKG, quiet = TRUE)
+stopifnot(all(levels(dat$Ecoregion) %in% eco_poly$US_L3NAME))
+
+eco_coverage <- eco_poly |>
+  mutate(area_km2 = as.numeric(st_area(geom)) / 1e6) |>
+  st_drop_geometry() |>
+  group_by(US_L3CODE, US_L3NAME) |>
+  summarise(area_km2 = sum(area_km2), .groups = "drop") |>
+  left_join(count(dat, US_L3NAME = as.character(Ecoregion), name = "sites"),
+            by = "US_L3NAME") |>
+  mutate(sites = coalesce(sites, 0L),
+         sampled = sites > 0,
+         area_share = area_km2 / sum(area_km2)) |>
+  arrange(desc(sampled), desc(area_km2))
+
+kable(eco_coverage, digits = 3, caption = "EPA Level III ecoregions in New York")
+cat(sprintf("Unsampled ecoregions: %.0f km² (%.1f%% of NY land area)\n",
+            sum(eco_coverage$area_km2[!eco_coverage$sampled]),
+            100 * sum(eco_coverage$area_share[!eco_coverage$sampled])))
 ```
 
-## 2. CH4 response transformations
+### Response
 
-CH4 is strongly right-skewed and has a few small negative values, so a plain
-log is not possible. Candidates:
+CH4 is strongly right-skewed and includes a few small negative site means, so
+it is modeled as log(CH4 + c). Iteration 1 found this gave the most normal
+residuals of the transforms tried (raw, asinh, Gamma GLM).
 
-| Name | Transform | Notes |
-|---|---|---|
-| raw | CH4 | reference |
-| log shift | log(CH4 + c) | c = \|min\| + `r SHIFT_ADD`; results depend somewhat on c |
-| asinh | asinh(CH4 / `r ASINH_SCALE`) | no shift needed; linear near 0, log-like above `r ASINH_SCALE` |
-| Gamma | CH4 + c, Gamma GLMM with log link | models the mean on the log scale; no back-transform bias |
-
-```{r transforms}
+```{r response}
 ch4_shift <- abs(min(dat$CH4)) + SHIFT_ADD
+dat <- dat |> mutate(CH4_resp = log(CH4 + ch4_shift))
 
-dat <- dat |>
-  mutate(
-    CH4_shift = CH4 + ch4_shift,
-    CH4_log = log(CH4_shift),
-    CH4_asinh = asinh(CH4 / ASINH_SCALE)
-  )
+## Back-transform from the model scale to flux. Gives the median flux, not the
+## mean; the mean correction is handled with uncertainty in the next notebook.
+back <- function(v) exp(v) - ch4_shift
 
 cat(sprintf("Shift c = %.4f; %d of 48 site means are negative\n",
             ch4_shift, sum(dat$CH4 < 0)))
 ```
 
-```{r transform-plots, fig.height=6}
-tr_long <- dat |>
-  select(Site_ID, raw = CH4, `log shift` = CH4_log, asinh = CH4_asinh) |>
-  pivot_longer(-Site_ID, names_to = "transform") |>
-  mutate(transform = factor(transform, levels = c("raw", "log shift", "asinh")))
-
-h <- ggplot(tr_long, aes(value)) +
-  geom_histogram(bins = 15, fill = "#2a78d6", color = "white") +
-  facet_wrap(~transform, scales = "free") +
-  labs(title = "Site-mean CH4 under each transformation", x = NULL, y = "Sites")
-
-q <- ggplot(tr_long, aes(sample = value)) +
-  stat_qq_line(color = "#c3c2b7") +
-  stat_qq(size = 1.6, color = "#2a78d6") +
-  facet_wrap(~transform, scales = "free") +
-  labs(title = "Normal Q-Q plots", x = "Theoretical", y = "Sample")
-
-h / q
+```{r response-plot, fig.height=4}
+ggplot(dat, aes(Ecoregion, CH4_resp, color = Ecoregion)) +
+  geom_boxplot(outlier.shape = NA, width = 0.5, color = "#898781") +
+  geom_jitter(width = 0.12, size = 2) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 3.5,
+               fill = "white", color = "black") +
+  scale_color_manual(values = ECO_COLS, guide = "none") +
+  labs(title = "Site-mean CH4 by ecoregion (model scale)",
+       subtitle = "Diamond = ecoregion mean",
+       x = NULL, y = "log(CH4 + c)")
 ```
 
-```{r transform-table}
-tr_long |>
-  group_by(transform) |>
-  summarise(
-    skewness = mean((value - mean(value))^3) / sd(value)^3,
-    shapiro_W = shapiro.test(value)$statistic,
-    shapiro_p = shapiro.test(value)$p.value,
-    .groups = "drop"
-  ) |>
-  kable(digits = 3, caption = "Shape of the CH4 response")
+### Covariate collinearity
+
+```{r pred-check}
+z_cov <- paste0("z_", names(COVARIATES))
+
+cor(dat[names(COVARIATES)], method = "spearman") |>
+  kable(digits = 2, caption = "Spearman ρ among the covariates")
+
+## Do the covariates differ by ecoregion? If strongly, ecoregion and the
+## covariates compete for the same variance in the complex model.
+dat |>
+  group_by(Ecoregion) |>
+  summarise(across(all_of(names(COVARIATES)), median), .groups = "drop") |>
+  kable(digits = 3, caption = "Covariate medians by ecoregion")
 ```
 
+## 2. Model fits
 
-**Decision (iteration 2):** CH4 is modeled as log(CH4 + c). In iteration 1 it
-gave the most normal response and residuals. asinh was similar but slightly
-skewed, and a Gamma GLMM on the shifted flux fit poorly (one site 5 SD out).
+All models use the same response and data. `lm()` fits are used where there
+is no random effect. Random-effect models are fit by REML for their
+estimates, and by ML (`REML = FALSE`) wherever AIC is compared with an `lm()`
+fit.
 
-## 3. Random effect check: is `(1 | Ecoregion)` needed?
+| Model | Formula | Role |
+|---|---|---|
+| `null` | `CH4_resp ~ 1` | reference |
+| `eco_fixed` | `CH4_resp ~ Ecoregion` | upscaling candidate |
+| `eco_random` | `CH4_resp ~ 1 + (1 \| Ecoregion)` | upscaling candidate |
+| `complex_fixed` | `CH4_resp ~ Ecoregion + WETprob × DMV_sd + GEO_modefrac` | reported model |
+| `complex_random` | `CH4_resp ~ WETprob × DMV_sd + GEO_modefrac + (1 \| Ecoregion)` | reported model, random-ecoregion version |
+| `covariates` | `CH4_resp ~ WETprob × DMV_sd + GEO_modefrac` | what the covariates explain without ecoregion |
 
-Sites were sampled 12 per ecoregion, so ecoregion is the natural grouping. A
-random intercept is needed if sites in the same ecoregion have more similar
-flux than the predictors explain. The check below fits each model with and
-without the random intercept, both by maximum likelihood so their AICs are
-comparable. It also reports the ecoregion share of the residual variance.
+```{r formulas}
+cov_terms <- "z_WETprob_mean * z_DMV_sd + z_GEO_modefrac"
 
-```{r re-check}
-f_ch4 <- as.formula(paste("CH4_log ~", paste(z_preds, collapse = " + ")))
-f_co2 <- as.formula(paste("CO2 ~", paste(z_preds, collapse = " + ")))
+FORMULAS <- list(
+  null           = CH4_resp ~ 1,
+  eco_fixed      = CH4_resp ~ Ecoregion,
+  eco_random     = CH4_resp ~ 1 + (1 | Ecoregion),
+  complex_fixed  = as.formula(paste("CH4_resp ~ Ecoregion +", cov_terms)),
+  complex_random = as.formula(paste("CH4_resp ~", cov_terms, "+ (1 | Ecoregion)")),
+  covariates     = as.formula(paste("CH4_resp ~", cov_terms))
+)
 
-re_check <- function(f, label) {
-  m_lm <- lm(f, data = dat)
-  m_re <- lmer(update(f, . ~ . + (1 | Ecoregion)), data = dat, REML = FALSE)
-  vc <- as.data.frame(VarCorr(m_re))
-  lrt <- anova(m_re, m_lm)
-  tibble(
-    response = label,
-    ecoregion_var = vc$vcov[vc$grp == "Ecoregion"],
-    residual_var = vc$vcov[vc$grp == "Residual"],
-    ecoregion_share = ecoregion_var / (ecoregion_var + residual_var),
-    AIC_lm = AIC(m_lm),
-    AIC_lmer = AIC(m_re),
-    LRT_p = lrt$`Pr(>Chisq)`[2]
-  )
+is_mixed <- function(f) any(grepl("|", deparse(f), fixed = TRUE))
+
+## REML = TRUE for estimates; FALSE for likelihood / AIC comparisons with lm
+fit_model <- function(f, d, REML = TRUE) {
+  if (is_mixed(f)) lmer(f, data = d, REML = REML) else lm(f, data = d)
 }
 
-bind_rows(re_check(f_ch4, "CH4 (log shift)"), re_check(f_co2, "CO2")) |>
-  kable(digits = 3, caption = "Ecoregion random intercept: ML fits with and without")
+fits <- map(FORMULAS, fit_model, d = dat)
+fits_ml <- map(FORMULAS, fit_model, d = dat, REML = FALSE)
 ```
 
-The LRT p-value is conservative, because the variance is tested at its
-boundary of zero. Halving it is the usual correction.
+## 3. Ecoregion only: fixed vs. random
 
-**Decision:** drop the random effect and fit `lm()` with the same formula.
-The basis is the result above, not an assumption that sites within an
-ecoregion are independent. Residual similarity at shorter distances (within an
-ecoregion) is checked in Section 6. Ecoregion is also a mappable layer, so it
-could return later as a fixed effect if residuals show regional structure.
+### 3.1 Fits
 
-## 4. CH4 model (log shift, `lm`)
+```{r eco-fits}
+summary(fits$eco_fixed)
+anova(fits$null, fits$eco_fixed)
 
-### 4.1 Base model
-
-```{r ch4-base}
-ch4_base <- lm(f_ch4, data = dat)
-summary(ch4_base)
+summary(fits$eco_random)
 ```
 
-```{r coef-fn}
-## Coefficient estimates with 95% CIs, one row per term per model
+### 3.2 Is there between-ecoregion variance?
+
+The ecoregion variance (τ²) is estimated from **only 4 levels**, so it is
+poorly determined. The ML estimate is biased low with this few groups, so
+REML is shown too. The profile interval shows the range of τ values the data
+are consistent with. It is a check on whether τ can be estimated at all, not
+an uncertainty estimate for upscaling.
+
+```{r eco-variance}
+vc_tbl <- function(m, label) {
+  vc <- as.data.frame(VarCorr(m))
+  tibble(fit = label,
+         tau2_ecoregion = vc$vcov[vc$grp == "Ecoregion"],
+         sigma2_residual = vc$vcov[vc$grp == "Residual"],
+         ICC = tau2_ecoregion / (tau2_ecoregion + sigma2_residual))
+}
+bind_rows(vc_tbl(fits$eco_random, "REML"), vc_tbl(fits_ml$eco_random, "ML")) |>
+  kable(digits = 3, caption = "Variance components of eco_random")
+
+## Profile CI for the SDs (.sig01 = tau, .sigma = residual SD)
+tau_ci <- confint(fits$eco_random, parm = ".sig01", method = "profile", quiet = TRUE)
+kable(tau_ci, digits = 3, caption = "Profile 95% interval for the ecoregion SD τ")
+
+## LRT of tau^2 = 0: on the boundary, so halve the chi-square p-value
+lrt <- as.numeric(2 * (logLik(fits_ml$eco_random) - logLik(fits_ml$null)))
+cat(sprintf("LRT for (1 | Ecoregion) vs null: chi2 = %.2f, boundary-corrected p = %.3f\n",
+            lrt, 0.5 * pchisq(lrt, df = 1, lower.tail = FALSE)))
+```
+
+### 3.3 Ecoregion estimates: fixed means vs. shrunken random effects
+
+With a fixed effect, each ecoregion gets its own sample mean. With a random
+effect, each ecoregion mean is pulled toward the overall mean by the factor
+τ² / (τ² + σ²/n), where n = 12 sites per ecoregion. Ecoregions with a weaker
+signal are pulled further.
+
+The **unlabeled** row is the prediction for wetlands in the five unsampled EPA
+ecoregions:
+
+* `eco_random`: the population intercept (the random effect set to 0). This
+  is what the model is built to predict for a new group.
+* `eco_fixed`: no coefficient exists. The closest equivalent is the
+  equal-weight average of the four ecoregion means. Because the design is
+  balanced (12 per ecoregion), this equals the overall sample mean.
+
+So the **point predictions** for unlabeled areas are nearly the same under
+either model. The real difference is in the uncertainty. The random-effect
+model carries τ² into the prediction for a new ecoregion. The fixed-effect
+model has no basis for that term. This is picked up in the uncertainty
+notebook.
+
+```{r eco-estimates}
+eco_lv <- levels(dat$Ecoregion)
+nd_eco <- tibble(Ecoregion = factor(eco_lv, levels = eco_lv))
+
+shrink_tbl <- dat |>
+  group_by(Ecoregion) |>
+  summarise(n = n(), sample_mean = mean(CH4_resp), .groups = "drop") |>
+  mutate(fixed = predict(fits$eco_fixed, nd_eco),
+         random = predict(fits$eco_random, nd_eco),
+         grand = fixef(fits$eco_random)[["(Intercept)"]],
+         shrinkage = 1 - (random - grand) / (sample_mean - grand)) |>
+  select(-grand) |>
+  mutate(Ecoregion = as.character(Ecoregion)) |>
+  add_row(Ecoregion = "Unlabeled (new ecoregion)", n = 0L, sample_mean = NA,
+          fixed = mean(predict(fits$eco_fixed, nd_eco)),
+          random = predict(fits$eco_random, tibble(Ecoregion = "new"),
+                           allow.new.levels = TRUE),
+          shrinkage = NA) |>
+  mutate(fixed_flux = back(fixed), random_flux = back(random))
+
+kable(shrink_tbl, digits = 3,
+      caption = paste("Ecoregion predictions, model scale and back-transformed",
+                      "(median flux, same units as CH4_avg). shrinkage = fraction of the",
+                      "distance from the overall mean removed by the random effect"))
+```
+
+```{r eco-estimates-plot, fig.height=4}
+shrink_tbl |>
+  select(Ecoregion, sample_mean, fixed, random) |>
+  pivot_longer(c(fixed, random), names_to = "model", values_to = "estimate") |>
+  mutate(Ecoregion = factor(Ecoregion, levels = rev(shrink_tbl$Ecoregion))) |>
+  ggplot(aes(estimate, Ecoregion, color = model, shape = model)) +
+  geom_vline(xintercept = fixef(fits$eco_random)[["(Intercept)"]], color = "#c3c2b7",
+             linetype = "dashed") +
+  geom_point(size = 3, position = position_dodge(width = 0.4)) +
+  scale_color_manual(values = c(fixed = "#2a78d6", random = "#eb6834")) +
+  labs(title = "Ecoregion estimates: fixed effect vs. random effect (model scale)",
+       subtitle = "Dashed line = population intercept of eco_random",
+       x = "log(CH4 + c)", y = NULL, color = NULL, shape = NULL)
+```
+
+## 4. Complex model
+
+### 4.1 Fits
+
+```{r complex-fits}
+summary(fits$complex_fixed)
+summary(fits$complex_random)
+summary(fits$covariates)
+
+## Does each block add to the other? (lm fits, nested F-tests)
+anova(fits$eco_fixed, fits$complex_fixed)   # covariates given ecoregion
+anova(fits$covariates, fits$complex_fixed)  # ecoregion given covariates
+```
+
+### 4.2 Coefficients
+
+```{r coefs, fig.height=4.5}
+## Fixed-effect estimates with 95% Wald CIs, one row per term per model
 coef_table <- function(models) {
   imap_dfr(models, function(m, nm) {
-    ci <- confint(m)
-    tibble(model = nm, term = names(coef(m)), estimate = unname(coef(m)),
-           lo = ci[, 1], hi = ci[, 2])
+    est <- if (inherits(m, "merMod")) fixef(m) else coef(m)
+    ci <- if (inherits(m, "merMod")) confint(m, parm = "beta_", method = "Wald") else confint(m)
+    tibble(model = nm, term = names(est), estimate = unname(est),
+           lo = ci[names(est), 1], hi = ci[names(est), 2])
   }) |>
     filter(term != "(Intercept)") |>
     mutate(term = gsub("z_", "", term),
@@ -251,312 +388,323 @@ coef_table <- function(models) {
            model = factor(model, levels = names(models)))
 }
 
-plot_coefs <- function(ct, title, xlab = "Estimate per 1 SD") {
-  ggplot(ct, aes(estimate, term)) +
-    geom_vline(xintercept = 0, color = "#c3c2b7") +
-    geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0, color = "#898781") +
-    geom_point(size = 2.6, color = "#2a78d6") +
-    facet_wrap(~model) +
-    labs(title = title, subtitle = "95% confidence intervals", x = xlab, y = NULL)
-}
+coef_table(fits[c("complex_fixed", "complex_random", "covariates")]) |>
+  ggplot(aes(estimate, term)) +
+  geom_vline(xintercept = 0, color = "#c3c2b7") +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0, color = "#898781") +
+  geom_point(size = 2.6, color = "#2a78d6") +
+  facet_wrap(~model) +
+  labs(title = "Complex model coefficients",
+       subtitle = "95% CIs. Covariates per 1 SD; ecoregion terms relative to the first level",
+       x = "Estimate (log scale; exp(b) = multiplicative change)", y = NULL)
 ```
 
-### 4.2 Interaction: WETprob × NDVI (a priori hypothesis)
+### 4.3 The WETprob × DMV_sd interaction
 
-**Hypothesis:** wetter sites with lower vegetation productivity have higher
-CH4. In the model this is `WETprob_mean * NDVI_mean`. The hypothesis predicts
-a **negative** interaction coefficient: as WETprob rises, the NDVI slope
-becomes more negative, so low-NDVI sites stand out most where it is wet.
-
-Two caveats for reading the result:
-
-* At 10 m in summer, low NDVI in a wetland often means open water or bare,
-  saturated ground, not only low productivity. NDVI and NDWI are close to mirror
-  images here (EDA: ρ ≈ −0.87). So "low NDVI" may partly be a second wetness
-  signal.
-* WETprob mean is bunched near 1 (see the quantiles below). That leaves little
-  spread for an interaction to act on.
-
-```{r wetprob-range}
-quantile(dat$WETprob_mean, c(0, 0.1, 0.25, 0.5, 0.75, 0.9, 1)) |> round(3)
-```
-
-```{r ch4-int}
-ch4_int <- lm(update(f_ch4, . ~ . + z_WETprob_mean:z_NDVI_mean), data = dat)
-summary(ch4_int)
-
-anova(ch4_base, ch4_int)
-c(AIC_base = AIC(ch4_base), AIC_interaction = AIC(ch4_int))
-```
-
-```{r int-plot-fn}
-## Predicted CH4 vs `x` at low / median / high `mod` (10th, 50th, 90th
-## percentiles); other predictors held at their mean (z = 0). Predictions are
-## back-transformed to flux: exp(fit) - c (the median, not the mean, flux).
-plot_interaction <- function(m, x, mod, title) {
-  zx <- paste0("z_", x)
-  zm <- paste0("z_", mod)
-  q <- quantile(dat[[zm]], c(0.1, 0.5, 0.9))
-  grid <- crossing(!!zx := seq(min(dat[[zx]]), max(dat[[zx]]), length.out = 50),
-                   !!zm := q)
-  for (p in setdiff(z_preds, c(zx, zm))) grid[[p]] <- 0
-  pr <- predict(m, newdata = grid, interval = "confidence")
-  grid <- grid |>
-    mutate(fit = exp(pr[, "fit"]) - ch4_shift,
-           lo = exp(pr[, "lwr"]) - ch4_shift,
-           hi = exp(pr[, "upr"]) - ch4_shift,
-           xval = .data[[zx]] * sd(dat[[x]]) + mean(dat[[x]]),
-           level = factor(.data[[zm]], levels = q,
-                          labels = sprintf("%s %s (%.2f)", c("Low", "Median", "High"), mod,
-                                           q * sd(dat[[mod]]) + mean(dat[[mod]]))))
-  ggplot(grid, aes(xval, fit)) +
-    geom_point(data = dat, aes(x = .data[[x]], y = CH4), color = "#c3c2b7", size = 1.8,
-               inherit.aes = FALSE) +
-    geom_ribbon(aes(ymin = lo, ymax = hi, fill = level), alpha = 0.15) +
-    geom_line(aes(color = level, linetype = level), linewidth = 0.9) +
-    scale_color_manual(values = c("#2a78d6", "#898781", "#eb6834")) +
-    scale_fill_manual(values = c("#2a78d6", "#898781", "#eb6834")) +
-    scale_y_continuous(trans = scales::pseudo_log_trans(sigma = 0.01),
-                       breaks = c(0, 0.01, 0.1, 1, 10)) +
-    labs(title = title,
-         subtitle = "Other predictors at their mean; grey points = observed site means",
-         x = x, y = "CH4 flux (pseudo-log axis)",
-         color = NULL, fill = NULL, linetype = NULL)
-}
-```
+WETprob is bunched near 1 and DMV_sd is right-skewed (a few sites with very
+high microtopographic variability). Both of these mean a handful of sites can
+drive the interaction. The Cook's distance table in 4.4 shows which ones.
 
 ```{r int-plot, fig.height=5}
-plot_interaction(ch4_int, "NDVI_mean", "WETprob_mean",
-                 "Predicted CH4 vs NDVI at low, median and high WETprob")
+## Predicted CH4 vs DMV_sd at low / median / high WETprob (10th, 50th, 90th
+## percentiles), GEO_modefrac at its mean, averaged over ecoregions
+## (equal weight). Back-transformed: median flux.
+q_wet <- quantile(dat$z_WETprob_mean, c(0.1, 0.5, 0.9))
+grid <- crossing(z_DMV_sd = seq(min(dat$z_DMV_sd), max(dat$z_DMV_sd), length.out = 60),
+                 z_WETprob_mean = q_wet,
+                 Ecoregion = factor(eco_lv, levels = eco_lv)) |>
+  mutate(z_GEO_modefrac = 0)
+grid$fit <- predict(fits$complex_fixed, grid)
+grid <- grid |>
+  group_by(z_DMV_sd, z_WETprob_mean) |>
+  summarise(fit = mean(fit), .groups = "drop") |>
+  mutate(DMV_sd = z_DMV_sd * sd(dat$DMV_sd) + mean(dat$DMV_sd),
+         level = factor(z_WETprob_mean, levels = q_wet,
+                        labels = sprintf("%s WETprob (%.2f)", c("Low", "Median", "High"),
+                                         q_wet * sd(dat$WETprob_mean) + mean(dat$WETprob_mean))))
+
+ggplot(grid, aes(DMV_sd, back(fit))) +
+  geom_point(data = dat, aes(DMV_sd, CH4, fill = WETprob_mean), shape = 21,
+             color = "white", size = 2.4, inherit.aes = FALSE) +
+  geom_line(aes(color = level, linetype = level), linewidth = 0.9) +
+  scale_color_manual(values = c("#2a78d6", "#898781", "#eb6834")) +
+  scale_fill_gradient(low = "#e1e0d9", high = "#1f4e8c", name = "Observed WETprob") +
+  scale_y_continuous(trans = scales::pseudo_log_trans(sigma = 0.01),
+                     breaks = c(0, 0.01, 0.1, 1, 10)) +
+  labs(title = "complex_fixed: predicted CH4 vs DMV SD at low, median and high WETprob",
+       subtitle = "GEO_modefrac at its mean; averaged over ecoregions; points = observed site means",
+       x = "DMV_sd (10 m)", y = "CH4 flux (pseudo-log axis)",
+       color = NULL, linetype = NULL) +
+  theme(legend.position = "right")
 ```
 
-### 4.3 Other candidate interactions (exploratory)
+### 4.4 Diagnostics
 
-These interactions also have an ecological rationale. Each is added to the base
-model **one at a time**:
+```{r diag, fig.height=7}
+diag_models <- fits[c("eco_fixed", "eco_random", "complex_fixed", "complex_random")]
 
-| Interaction | Rationale |
-|---|---|
-| WETprob × DEM_sd | Wet, flat ground is saturated evenly; on wet ground with hummocks and hollows, CH4 depends on microtopography |
-| WETprob × CHM_mean | Separates open wet sites (marsh, fen) from wet forested sites (swamp); open, wet sites are expected to emit more |
-| WETprob × ppt_annual | A wet landscape in a wetter climate stays saturated longer |
-| DEM_sd × ppt_annual | Microtopography matters more where water supply is limited |
-| NDVI × CHM_mean | Productive herbaceous cover (high NDVI, low canopy) vs forest |
+d <- imap_dfr(diag_models, \(m, nm) tibble(
+  model = nm, fitted = fitted(m), resid = residuals(m),
+  Wetland_Type = dat$Wetland_Type
+)) |>
+  mutate(model = factor(model, levels = names(diag_models)))
 
-With n = 48 and five main effects, the model can only support one or two
-interactions. Taking the best of several also overstates its evidence: with
-six candidates, one p ≈ 0.05 is close to what chance alone produces.
-**Treat this table as hypothesis-generating.** Any interaction carried forward
-should be checked with cross-validation, not only its p-value.
-
-```{r int-screen}
-candidates <- c(
-  "WETprob × NDVI"       = "z_WETprob_mean:z_NDVI_mean",
-  "WETprob × DEM_sd"     = "z_WETprob_mean:z_DEM_sd",
-  "WETprob × CHM_mean"   = "z_WETprob_mean:z_CHM_mean",
-  "WETprob × ppt_annual" = "z_WETprob_mean:z_ppt_annual",
-  "DEM_sd × ppt_annual"  = "z_DEM_sd:z_ppt_annual",
-  "NDVI × CHM_mean"      = "z_NDVI_mean:z_CHM_mean"
-)
-
-int_models <- map(candidates, \(trm) lm(update(f_ch4, as.formula(paste(". ~ . +", trm))), data = dat))
-
-imap_dfr(int_models, function(m, nm) {
-  cf <- summary(m)$coefficients
-  row <- cf[grepl(":", rownames(cf)), , drop = FALSE]
-  tibble(interaction = nm, estimate = row[1, 1], p = row[1, 4],
-         dAIC = AIC(m) - AIC(ch4_base),
-         R2 = summary(m)$r.squared, adj_R2 = summary(m)$adj.r.squared)
-}) |>
-  add_row(interaction = "(base, no interaction)", estimate = NA, p = NA, dAIC = 0,
-          R2 = summary(ch4_base)$r.squared, adj_R2 = summary(ch4_base)$adj.r.squared,
-          .before = 1) |>
-  kable(digits = 3, caption = "CH4 base model plus one interaction (dAIC < 0 = better than base)")
+rf <- ggplot(d, aes(fitted, resid)) +
+  geom_hline(yintercept = 0, color = "#c3c2b7") +
+  geom_point(aes(color = Wetland_Type, shape = Wetland_Type), size = 2) +
+  facet_wrap(~model, nrow = 1, scales = "free_x") +
+  scale_color_manual(values = WT_COLS) +
+  scale_shape_manual(values = WT_SHAPES) +
+  labs(title = "Residuals vs fitted", x = "Fitted", y = "Residual",
+       color = "Wetland type", shape = "Wetland type")
+qq <- ggplot(d, aes(sample = resid)) +
+  stat_qq_line(color = "#c3c2b7") +
+  stat_qq(size = 1.6, color = "#2a78d6") +
+  facet_wrap(~model, nrow = 1) +
+  labs(title = "Residual normal Q-Q", x = "Theoretical", y = "Sample")
+rf / qq
 ```
 
-::: {.panel-tabset}
+Wetland type is not in any model, because the production maps have no wetland
+classes. Colouring the residuals by type shows whether ecoregion and the
+covariates already capture the differences between types.
 
-#### WETprob × DEM_sd
-
-```{r int-dem, fig.height=5}
-plot_interaction(int_models[["WETprob × DEM_sd"]], "DEM_sd", "WETprob_mean",
-                 "Predicted CH4 vs DEM SD at low, median and high WETprob")
+```{r influence}
+## Influential sites in the complex model (Cook's D > 4/n is the usual flag)
+tibble(Site_ID = dat$Site_ID, Ecoregion = dat$Ecoregion,
+       WETprob_mean = dat$WETprob_mean, DMV_sd = dat$DMV_sd,
+       GEO_modefrac = dat$GEO_modefrac, CH4 = dat$CH4,
+       cooks_d = cooks.distance(fits$complex_fixed),
+       leverage = hatvalues(fits$complex_fixed)) |>
+  arrange(desc(cooks_d)) |>
+  filter(cooks_d > 4 / nrow(dat)) |>
+  kable(digits = 3, caption = "complex_fixed: sites with Cook's D > 4/n")
 ```
 
-#### WETprob × CHM_mean
+### 4.5 Sensitivity: the most influential site and the scale of DMV_sd
 
-```{r int-chm, fig.height=5}
-plot_interaction(int_models[["WETprob × CHM_mean"]], "CHM_mean", "WETprob_mean",
-                 "Predicted CH4 vs CHM mean at low, median and high WETprob")
-```
+Two checks on whether the interaction is a general pattern or the work of a
+few sites. Both refit `complex_fixed` and report in-sample R² and LOO cvR²
+(Section 5 explains cvR²):
 
-:::
+* **Drop the site with the largest Cook's D.**
+* **Use log(DMV_sd)** in place of DMV_sd, which pulls in the long right tail.
 
-### 4.4 Coefficients and diagnostics
+```{r sensitivity}
+top_site <- dat$Site_ID[which.max(cooks.distance(fits$complex_fixed))]
 
-```{r ch4-models}
-ch4_models <- list(
-  base = ch4_base,
-  `+ WETprob × NDVI` = ch4_int
-)
-```
-
-```{r ch4-coefs, fig.height=4.5}
-plot_coefs(coef_table(ch4_models), "CH4 (log shift): coefficients",
-           "Estimate per 1 SD (log scale; exp(b) = multiplicative change)")
-```
-
-```{r diag-fn}
-## Residuals vs fitted and normal Q-Q, models side by side
-diag_plots <- function(models) {
-  d <- imap_dfr(models, \(m, nm) tibble(
-    model = nm, fitted = fitted(m), resid = residuals(m),
-    Wetland_Type = dat$Wetland_Type
-  )) |>
-    mutate(model = factor(model, levels = names(models)))
-  rf <- ggplot(d, aes(fitted, resid)) +
-    geom_hline(yintercept = 0, color = "#c3c2b7") +
-    geom_point(aes(color = Wetland_Type, shape = Wetland_Type), size = 2) +
-    facet_wrap(~model, scales = "free") +
-    scale_color_manual(values = WT_COLS) +
-    scale_shape_manual(values = WT_SHAPES) +
-    labs(title = "Residuals vs fitted", x = "Fitted", y = "Residual",
-         color = "Wetland type", shape = "Wetland type")
-  qq <- ggplot(d, aes(sample = resid)) +
-    stat_qq_line(color = "#c3c2b7") +
-    stat_qq(size = 1.6, color = "#2a78d6") +
-    facet_wrap(~model, scales = "free") +
-    labs(title = "Residual normal Q-Q", x = "Theoretical", y = "Sample")
-  rf / qq
+sens_fit <- function(d, label) {
+  m <- lm(FORMULAS$complex_fixed, data = d)
+  folds <- seq_len(nrow(d))
+  pred <- base <- numeric(nrow(d))
+  for (i in folds) {
+    tr <- droplevels(d[-i, ])
+    pred[i] <- predict(lm(FORMULAS$complex_fixed, data = tr), d[i, ]) # ecoregion always in training
+    base[i] <- mean(tr$CH4_resp)
+  }
+  tibble(variant = label, n = nrow(d), R2 = summary(m)$r.squared,
+         cvR2_LOO = 1 - sum((d$CH4_resp - pred)^2) / sum((d$CH4_resp - base)^2),
+         `WETprob:DMV_sd` = coef(m)[["z_WETprob_mean:z_DMV_sd"]],
+         `p (interaction)` = summary(m)$coefficients["z_WETprob_mean:z_DMV_sd", 4])
 }
+
+bind_rows(
+  sens_fit(dat, "as specified"),
+  sens_fit(filter(dat, Site_ID != top_site), paste("without", top_site)),
+  sens_fit(mutate(dat, z_DMV_sd = as.numeric(scale(log(DMV_sd)))), "log(DMV_sd)")
+) |>
+  kable(digits = 3, caption = "complex_fixed sensitivity (interaction on the z scale of each variant)")
 ```
 
-```{r ch4-diag, fig.height=7}
-diag_plots(ch4_models)
+## 5. Model comparison: in-sample and cross-validated
+
+In-sample fit tells you how much of the 48-site variation a model accounts
+for. The upscaling question is how well it predicts **sites it was not fit
+to**. Three cross-validation schemes, from easiest to hardest:
+
+* **Leave one site out (LOO).** The held-out site's ecoregion is in the
+  training data. This is like predicting an unsampled wetland in a sampled
+  ecoregion.
+* **Spatial blocks.** Sites within `r CV_BLOCK_KM` km of each other are held
+  out together, so nearby, similar sites can't stand in for each other.
+* **Leave one ecoregion out (LOEO).** All 12 sites of an ecoregion are held
+  out. This is the **unlabeled-area** case. Random-effect models predict the
+  population mean. Fixed-ecoregion models have no coefficient for the
+  held-out ecoregion, so they predict with the equal-weight average over the
+  three training ecoregions (Section 3.3).
+
+Predictive R² = 1 − SSE / SS, where SS uses the **training-fold mean** as
+the baseline prediction. It can be negative: ≤ 0 means the model predicts
+held-out sites no better than the mean of the training sites. Standardizing
+covariates on all 48 sites does not leak information between folds, because
+a linear model's fitted values don't depend on how its covariates are
+centered or scaled.
+
+```{r cv-fn}
+## Predict new sites. Random-effect models use the ecoregion BLUP when the
+## ecoregion was in training and the population mean otherwise. Fixed-ecoregion
+## lm models average predictions over the training ecoregions when the
+## ecoregion is new.
+predict_new <- function(m, newdata) {
+  newdata$Ecoregion <- as.character(newdata$Ecoregion)
+  if (inherits(m, "merMod")) {
+    return(unname(predict(m, newdata = newdata, allow.new.levels = TRUE)))
+  }
+  lv <- m$xlevels$Ecoregion
+  if (is.null(lv)) return(unname(predict(m, newdata)))
+  known <- newdata$Ecoregion %in% lv
+  out <- numeric(nrow(newdata))
+  if (any(known)) out[known] <- predict(m, newdata[known, , drop = FALSE])
+  if (any(!known)) {
+    out[!known] <- Reduce(`+`, lapply(lv, \(l) {
+      predict(m, mutate(newdata[!known, , drop = FALSE], Ecoregion = l))
+    })) / length(lv)
+  }
+  out
+}
+
+FOLDS <- list(
+  LOO = seq_len(nrow(dat)),
+  spatial = cutree(hclust(dist(dat[c("x", "y")]) / 1000, method = "complete"),
+                   h = CV_BLOCK_KM),
+  LOEO = as.integer(dat$Ecoregion)
+)
+
+cv_predict <- function(f, folds) {
+  pred <- base <- numeric(nrow(dat))
+  for (k in unique(folds)) {
+    test <- folds == k
+    train <- droplevels(dat[!test, ])
+    m <- suppressMessages(fit_model(f, train))
+    pred[test] <- predict_new(m, dat[test, ])
+    base[test] <- mean(train$CH4_resp)
+  }
+  tibble(Site_ID = dat$Site_ID, obs = dat$CH4_resp, pred = pred, base = base)
+}
+
+pred_r2 <- function(obs, pred, base) 1 - sum((obs - pred)^2) / sum((obs - base)^2)
+
+imap_dfr(FOLDS, \(f, nm) tibble(scheme = nm, folds = n_distinct(f),
+                                min_held_out = min(table(f)),
+                                max_held_out = max(table(f)))) |>
+  kable(caption = "Cross-validation folds")
 ```
 
-Wetland type is not in the model, because it can't be mapped. Colouring the
-residuals by type shows whether the predictors already capture the differences
-between types.
-
-## 5. CO2 model
-
-CO2 is roughly symmetric and includes many negative values (uptake), so it is
-modeled untransformed with the same predictors.
-
-```{r co2-fit}
-co2_models <- list(base = lm(f_co2, data = dat))
-summary(co2_models$base)
+```{r cv-run}
+cv_res <- map(FORMULAS, \(f) map(FOLDS, \(fo) cv_predict(f, fo)))
 ```
 
-```{r co2-coefs, fig.height=3.5}
-plot_coefs(coef_table(co2_models), "CO2: coefficients")
+```{r comparison}
+r2_in <- function(m) {
+  if (inherits(m, "merMod")) {
+    r <- suppressWarnings(r.squaredGLMM(m))
+    c(R2_marginal = unname(r[1, "R2m"]), R2_conditional = unname(r[1, "R2c"]))
+  } else {
+    r <- summary(m)$r.squared
+    c(R2_marginal = r, R2_conditional = r)
+  }
+}
+
+comparison <- imap_dfr(FORMULAS, function(f, nm) {
+  r2 <- r2_in(fits[[nm]])
+  cv <- map_dbl(cv_res[[nm]], \(p) pred_r2(p$obs, p$pred, p$base))
+  tibble(model = nm,
+         k = attr(logLik(fits_ml[[nm]]), "df"),
+         AICc = AICc(fits_ml[[nm]]),
+         R2_marginal = r2[["R2_marginal"]],
+         R2_conditional = r2[["R2_conditional"]],
+         adj_R2 = if (inherits(fits[[nm]], "lm")) summary(fits[[nm]])$adj.r.squared else NA,
+         cvR2_LOO = cv[["LOO"]], cvR2_spatial = cv[["spatial"]], cvR2_LOEO = cv[["LOEO"]],
+         cvRMSE_LOO = sqrt(mean((cv_res[[nm]]$LOO$obs - cv_res[[nm]]$LOO$pred)^2)))
+}) |>
+  mutate(dAICc = AICc - min(AICc), .after = AICc)
+
+kable(comparison, digits = 3,
+      caption = paste("Model comparison on the model (log) scale. AICc from ML fits.",
+                      "R2_marginal = fixed effects only; R2_conditional adds the ecoregion",
+                      "random effect (equal to R2 for lm fits)"))
 ```
 
-```{r co2-diag, fig.height=6}
-diag_plots(co2_models)
+How to read the R² columns for the random-effect models:
+
+* `eco_random` has no fixed effects, so its marginal R² is 0. Its conditional
+  R² is the share explained by the shrunken ecoregion means, which is the
+  comparable number to `eco_fixed`'s R².
+* The CV columns are directly comparable across all models. In LOO and
+  spatial CV, random-effect models use the ecoregion BLUP. In LOEO, every
+  model predicts a new ecoregion.
+
+```{r cv-plot, fig.height=6}
+cv_long <- imap_dfr(cv_res, \(by_scheme, nm) bind_rows(by_scheme, .id = "scheme") |>
+                      mutate(model = nm)) |>
+  left_join(select(dat, Site_ID, Ecoregion), by = "Site_ID") |>
+  mutate(model = factor(model, levels = names(FORMULAS)),
+         scheme = factor(scheme, levels = names(FOLDS)))
+
+cv_long |>
+  filter(model != "null") |>
+  ggplot(aes(pred, obs, color = Ecoregion)) +
+  geom_abline(color = "#c3c2b7") +
+  geom_point(size = 1.6) +
+  facet_grid(scheme ~ model) +
+  scale_color_manual(values = ECO_COLS) +
+  coord_equal() +
+  labs(title = "Cross-validated predictions vs observed (model scale)",
+       x = "Predicted log(CH4 + c)", y = "Observed log(CH4 + c)", color = NULL)
 ```
 
-## 6. Spatial autocorrelation in residuals
+## 6. Predictions for unlabeled areas
 
-Sites cluster in space (the nearest neighbour is a median of ~14 km away, and a
-few pairs are under 1 km apart). If nearby sites have similar residuals, the
-model's standard errors are too small. Two checks:
+These are the point predictions each model would give for a wetland in one of
+the five unsampled EPA ecoregions (Section 1). For the complex models the covariates are set to
+their sample means (z = 0). The random-effect versions predict from the
+population intercept. The fixed versions average over the four ecoregions.
 
-* **Moran's I.** I near 0 means no spatial pattern; positive I means nearby
-  residuals are alike. The p-value comes from 999 random permutations of the
-  residuals among sites (one-sided, testing for positive autocorrelation). Two
-  weightings are shown:
-    * **Neighbours within `r 25` km** (main test): every site pair closer than
-      25 km counts equally.
-    * **Inverse distance**: weights are 1/distance, so the handful of site
-      pairs under 1 km dominate. This can give a very different answer from
-      the band test.
-* **Correlogram:** Moran's I for site pairs within distance bands, to see at
-  what distance any similarity fades.
+```{r unlabeled}
+nd_new <- tibble(Ecoregion = "Unlabeled", z_WETprob_mean = 0, z_DMV_sd = 0,
+                 z_GEO_modefrac = 0)
+imap_dfr(fits[c("eco_fixed", "eco_random", "complex_fixed", "complex_random")],
+         \(m, nm) tibble(model = nm, model_scale = predict_new(m, nd_new))) |>
+  mutate(flux_median = back(model_scale)) |>
+  kable(digits = 3, caption = "Prediction for an unlabeled area (covariates at their means)")
+```
 
-```{r moran-fn}
+## 7. Spatial autocorrelation in residuals
+
+If nearby sites have similar residuals, the model's standard errors are too
+small, and the spatial CV in Section 5 will be worse than LOO. Moran's I is
+tested with 999 permutations (one-sided, testing for positive
+autocorrelation). Neighbours are site pairs within `r NEIGHBOUR_KM` km.
+
+```{r moran}
 dist_km <- as.matrix(dist(dat[c("x", "y")])) / 1000
 
 moran_I <- function(r, w) {
   z <- r - mean(r)
   length(r) / sum(w) * sum(w * outer(z, z)) / sum(z^2)
 }
-
 moran_test <- function(r, w, nsim = 999) {
   obs <- moran_I(r, w)
   sims <- replicate(nsim, moran_I(sample(r), w))
   tibble(I = obs, expected = -1 / (length(r) - 1),
-         p = (sum(sims >= obs) + 1) / (nsim + 1)) # one-sided: positive autocorrelation
+         p = (sum(sims >= obs) + 1) / (nsim + 1))
 }
-
-NEIGHBOUR_KM <- 25
 
 w_band <- (dist_km <= NEIGHBOUR_KM) * 1
 diag(w_band) <- 0
-w_inv <- 1 / dist_km
-diag(w_inv) <- 0
-
-BANDS_KM <- c(0, 10, 25, 50, 100, 200, Inf)
-
-correlogram <- function(r) {
-  map_dfr(seq_len(length(BANDS_KM) - 1), function(i) {
-    w <- (dist_km > BANDS_KM[i] & dist_km <= BANDS_KM[i + 1]) * 1
-    diag(w) <- 0
-    tibble(band = sprintf("%g–%g km", BANDS_KM[i], BANDS_KM[i + 1]),
-           n_pairs = sum(w) / 2) |>
-      bind_cols(moran_test(r, w))
-  }) |>
-    mutate(band = factor(band, levels = band))
-}
-
 cat(sum(w_band) / 2, "site pairs within", NEIGHBOUR_KM, "km;",
     sum(rowSums(w_band) > 0), "of 48 sites have at least one neighbour\n")
 
-all_models <- c(setNames(ch4_models, paste("CH4", names(ch4_models))),
-                setNames(co2_models, paste("CO2", names(co2_models))))
-model_resid <- map(all_models, residuals)
+map_dfr(fits[c("null", "eco_fixed", "eco_random", "complex_fixed", "complex_random")],
+        \(m) moran_test(residuals(m), w_band), .id = "model") |>
+  kable(digits = 3, caption = sprintf("Moran's I of residuals, neighbours within %d km",
+                                      NEIGHBOUR_KM))
 ```
 
-```{r moran-table}
-bind_rows(
-  map_dfr(model_resid, \(r) moran_test(r, w_band), .id = "model") |>
-    mutate(weights = sprintf("within %d km", NEIGHBOUR_KM)),
-  map_dfr(model_resid, \(r) moran_test(r, w_inv), .id = "model") |>
-    mutate(weights = "inverse distance")
-) |>
-  select(model, weights, I, expected, p) |>
-  arrange(model) |>
-  kable(digits = 3, caption = "Moran's I of model residuals")
-```
-
-```{r correlogram, fig.height=4}
-corr_res <- map_dfr(model_resid, correlogram, .id = "model") |>
-  mutate(model = factor(model, levels = names(model_resid)))
-
-ggplot(corr_res, aes(band, I, group = model)) +
-  geom_hline(yintercept = -1 / 47, color = "#c3c2b7") +
-  geom_line(color = "#898781") +
-  geom_point(aes(size = n_pairs, shape = p < 0.05), color = "#2a78d6") +
-  facet_wrap(~model, nrow = 1) +
-  scale_size_area(max_size = 4, name = "Site pairs") +
-  scale_shape_manual(values = c(`FALSE` = 1, `TRUE` = 16), name = "p < 0.05") +
-  labs(title = "Residual correlogram", subtitle = "Grey line = expected I with no autocorrelation",
-       x = "Distance band", y = "Moran's I") +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
-
-corr_res |>
-  filter(BANDS_KM[as.integer(band)] < 50) |>
-  select(model, band, n_pairs, I, p) |>
-  kable(digits = 3, caption = "Correlogram, bands under 50 km")
-```
-
-Bands with few site pairs (small points) are noisy; focus on the short bands.
-
-```{r resid-map, fig.height=6}
-imap_dfr(model_resid, \(r, nm) tibble(model = nm, x = dat$x, y = dat$y,
-                                      resid_z = as.numeric(scale(r)))) |>
-  mutate(model = factor(model, levels = names(model_resid))) |>
+```{r resid-map, fig.height=5}
+imap_dfr(fits[c("eco_fixed", "complex_fixed")],
+         \(m, nm) tibble(model = nm, x = dat$x, y = dat$y,
+                         resid_z = as.numeric(scale(residuals(m))))) |>
   ggplot(aes(x / 1000, y / 1000, fill = resid_z)) +
   geom_point(shape = 21, size = 3, color = "white", stroke = 0.4) +
   facet_wrap(~model) +
@@ -569,18 +717,35 @@ imap_dfr(model_resid, \(r, nm) tibble(model = nm, x = dat$x, y = dat$y,
   theme(legend.position = "right")
 ```
 
-## 7. Next steps
+## 8. Summary and next steps
 
-* **Spatial autocorrelation in CH4 residuals.** If the 0–25 km signal holds, the
-  options from least to most complex are:
-    * a random intercept for a spatial group defined at that scale, for example
-      sites clustered within ~25 km (`(1 | site_group)` in lme4);
-    * a spatial correlation structure (`nlme::gls` with `corExp`); or
-    * spatially blocked cross-validation, so predictive skill is not overstated.
-* **Interactions.** Decide whether any interaction from Section 4.3 is worth
-  carrying forward, and test it with cross-validation.
-* **Predictive check.** Use leave-one-out or spatially blocked cross-validation
-  to see how well the models predict sites they were not fitted on.
+How to read the results:
+
+* **Fixed vs. random ecoregion (upscaling model).** Compare `eco_fixed` and
+  `eco_random` on dAICc, LOO cvR² and LOEO cvR². In sampled ecoregions the two
+  differ only by the shrinkage in Section 3.3. In unlabeled areas their point
+  predictions are almost the same (the overall mean). The argument for the
+  random effect is mainly that it gives a principled prediction **and a
+  variance** (τ²) for a new ecoregion. Note the caveat that τ² comes from only
+  4 ecoregions.
+* **Complex model (reported alongside).** In-sample R² vs. cross-validated R²
+  shows how much of the complex model's apparent advantage holds for new
+  sites. The gap between LOO and LOEO shows how much of it depends on knowing
+  the ecoregion.
+
+Next notebook (upscaling):
+
+1. **Back-transformation.** Convert log-scale predictions to **mean** flux
+   (lognormal / smearing correction, including τ² for unlabeled areas), or
+   estimate ecoregion means directly on the raw scale.
+2. **Uncertainty.** Site-level bootstrap of the ecoregion means, and
+   prediction variance for unlabeled areas.
+3. **Area.** Wetland area per EPA ecoregion as Σ WETprob × pixel area from the
+   production maps, zoned by `NY_ECO_L3_6347.gpkg` (join on `US_L3CODE`),
+   including the five unsampled ecoregions.
+4. **Complex model coverage.** Compare the covariate distributions at the 48
+   sites with statewide wetland pixels, if the complex model is reported as a
+   sensitivity check on the upscaled estimate.
 
 ```{r session}
 sessionInfo()
