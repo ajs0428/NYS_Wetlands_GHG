@@ -28,6 +28,7 @@ R_Code_Analysis/*/
 !Python_Code_Analysis/*.py
 
 !README.md
+!CURRENT_RESULTS.md
 !.gitignore
 !.gitattributes
 !.Rproj

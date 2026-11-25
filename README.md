@@ -15,7 +15,9 @@ $$GHG ~ DEM + CHM + TWI$$
 
 Where DEM, CHM, and TWI are raster layer bands and model predictors.
 
-Other data sources have come by extracting climate data from Google Earth Engine but haven't been super useful in models. 
+Climate data (ERA5-Land, PRISM normals) are extracted from Google Earth Engine in `Python_Code_Analysis/GHG_Climate_Extraction.ipynb`.
+
+Modeling findings so far are summarized in `CURRENT_RESULTS.md`.
 
 
 ## Current outline
@@ -27,10 +29,15 @@ Other data sources have come by extracting climate data from Google Earth Engine
 - `Data/Ecoregions/NY_ECO_L3_6347.gpkg` holds the EPA Level III ecoregion polygons for NY (9 ecoregions; 4 sampled). These zone the statewide upscaling.
 - Other iterations of ``NYDEC_GHG_Sites_6347*` have geospatial data extracted already, with the modeling dataframe output as `NYDEC_GHG_Model_Data.csv`. However these should be re-processed with new predictor extraction strategies (See TBD)
 
-`R_Code_Analysis/` holds modeling analysis scripts, and currently (11/17/2026) 
+`R_Code_Analysis/` holds modeling analysis scripts, and currently (11/25/2026) 
 
 - `GHG_Processing.R` – processes, explores, and creates dataframes for modeling
-- `GHG_Modeling.R` - models GHG (CO2 and CH4) as a function of geospatial variables
+- `GHG_Raster_Extraction.R` – extracts 10/30/50 m window raster predictors at the sites
+- `GHG_Raster_EDA.qmd` – predictor collinearity and univariate flux relationships
+- `GHG_Dredge.qmd` – all-subsets model selection on site means, with permutation tests and nested CV
+- `GHG_Model_SiteRanef.qmd` – visit-level models with a site random effect
+- `GHG_Model_SiteMeans.qmd` – ecoregion-only vs. complex CH4 models for upscaling
+- `Archive/GHG_Modeling.R` – earlier modeling script
 
 ## TBD
 
